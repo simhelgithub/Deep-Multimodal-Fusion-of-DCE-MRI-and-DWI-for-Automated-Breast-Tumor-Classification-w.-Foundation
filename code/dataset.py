@@ -72,11 +72,8 @@ class SingleInputDataset(torch.utils.data.Dataset):
         label = self.labels[index] if self.labels is not None else None
         mask = self.masks[index] if self.masks is not None else None
 
-        #print("DEBUG transform =", self.transforms)
-        #print("DEBUG img stats BEFORE transform:", img.min(), img.max(), img.mean())
         if self.transforms:
             img = self.transforms(img)
-        #print("DEBUG img stats after transform:", img[0].min(), img[0].max(), img[0].mean())
 
         if self.adc_map is not None:
           #rescale adc map as the image has been rescaled

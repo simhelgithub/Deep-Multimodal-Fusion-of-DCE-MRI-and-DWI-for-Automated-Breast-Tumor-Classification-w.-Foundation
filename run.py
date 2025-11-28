@@ -1,3 +1,11 @@
+try:
+    import pytorch_lightning
+    print("pytorch_lightning is already installed.")
+except ImportError:
+    print("pytorch_lightning not found. Installing...")
+    !pip install pytorch_lightning --quiet
+    print("pytorch_lightning installed.")
+
 # ------------------------------
 #  Run all script
 # ------------------------------
@@ -45,26 +53,22 @@ if device == "cpu":
 
 
 
-
-
 # ------------------------------
 # TRAINING LOOP
 # ------------------------------
 
 for fold in range(segnum):
-  dwi_key = None 
-  dce_key = None 
-  dwi_model = None
-  dce_model = None
-  dwi_backbone = None
-  dce_backbone = None
+
   train_labels = None
+  dwi_results = None
+  dce_results = None
+  fusion_results = None #todo remove?
 
   for method in methods:
       # ============================================================
       # 1. Prepare DWI + DCE Models (Single-Modality)
       # ============================================================
-      print(f"\n==== Preparing for {method.upper()} for fold {fold+1}/{segnum} ====\n")
+      print(f"\n= Preparing for {method.upper()} for fold {fold+1}/{segnum} =\n")
       local_model, dataloaders_dict, key, train_labels, backbone = prepare_single_custom_model(method, fold, parameters, device)
 
       # ============================================================
@@ -72,25 +76,22 @@ for fold in range(segnum):
       # ============================================================
 
       print(f"\n==== Training {method.upper()} model for fold {fold+1}/{segnum} ====\n")
-      local_model,train_acc_history,train_loss_history,val_acc_history,val_loss_history = run_single_model(fold, parameters, device, local_model, dataloaders_dict, key, method, train_labels)
-
+      results = run_single_model(fold, parameters, device, local_model, dataloaders_dict, key, method, train_labels)
+      
       #store fold models for fusion model
       if method == 'dwi':
-        dwi_model = local_model
-        dwi_key = key
-        dwi_backbone = backbone
+        dwi_results = results
       elif method == 'dce':
-        dce_model = local_model
-        dce_key = key
-        dce_backbone = backbone
+        dce_results = results
+
       print(f"\n==== Finished training {method.upper()} model for fold {fold+1}/{segnum} ====\n")
 
   # ============================================================
   # 3. Prepare Fusion Model
-  # ============================================================  
-  print(f"\n==== Preparing FUSION model for fold {fold+1}/{segnum} ====\n")
+  # ============================================================
+  print(f"\n= Preparing FUSION model for fold {fold+1}/{segnum} =\n")
 
-  dataloaders_dict,dwi_model, dce_model, fusion_model = prepare_fusion_model(dwi_key, dce_key, dce_backbone, dwi_backbone, fold, parameters, device)
+  dataloaders_dict,dwi_model, dce_model, fusion_model = prepare_fusion_model(dwi_results, dce_results, fold, parameters, device)
 
 
   # ============================================================
@@ -99,3 +100,14 @@ for fold in range(segnum):
   print(f"\n==== Training FUSION model for fold {fold+1}/{segnum} ====\n")
   run_fusion_model(dwi_model, dce_model, fusion_model, dataloaders_dict, parameters, device, fold, train_labels)
   print(f"\n==== Finished training FUSION model for fold {fold+1}/{segnum} ====\n")
+
+  #cleanup memory
+  del dataloaders_dict
+  del dwi_model
+  del dce_model
+  del fusion_model
+  del dwi_results
+  del dce_results
+  torch.cuda.empty_cache()
+  gc.collect()
+

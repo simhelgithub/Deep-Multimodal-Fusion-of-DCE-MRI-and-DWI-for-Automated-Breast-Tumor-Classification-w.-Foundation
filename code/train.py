@@ -8,328 +8,304 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+import pytorch_lightning as pl
+import torchmetrics
+from torchmetrics import MeanMetric
 
 from loss import *
 from selector_helpers import *
 
-# Visualize frequency (epochs)
 VIZ_FREQUENCY = 10
 
 
+class LightningSingleModel(pl.LightningModule):   
+    def __init__(self, model, method, criterion_clf, criterion_recon,
+                 optimizer_fn, device, parameters_dict, dataloaders):
+        super().__init__()
 
-def train_model(model, dataloaders, method, criterion_clf, criterion_recon, optimizer, device, parameters):
-    # ----
-    # setup
-    # ---
-    model_params = parameters[f"{method}_model_parameters"]
-    num_epochs = parameters["num_epochs"]
-    recon_enabled = model_params["recon_enabled"]
-    lambda_recon = model_params["lambda_recon"]
-    mimic_enabled = model_params["mimic_enabled"]
-    lambda_mimic = model_params["lambda_mimic"]
-    enable_modality_attention = model_params["enable_modality_attention"]
+        # store refs
+        self.model = model
+        self.method = method
+        self.criterion_clf = criterion_clf
+        self.criterion_recon = criterion_recon
+        self.optimizer_fn = optimizer_fn
+        self.parameters_dict = parameters_dict
+        self.dataloaders_ref = dataloaders   # only needed for viz
 
-    # mask params
-    mask_params = model_params["mask_parameters"]
-    mask_enabled = mask_params["mask"] 
-    lambda_mask = mask_params["lambda_mask"]
-    mask_loss_type = mask_params["mask_loss_type"]
+        # unpack model params
+        model_params = parameters_dict[f"{method}_model_parameters"]
+        self.model_params = model_params
+        self.recon_enabled = model_params["recon_enabled"]
+        self.lambda_recon = model_params["lambda_recon"]
+        self.mimic_enabled = model_params["mimic_enabled"]
+        self.lambda_mimic = model_params["lambda_mimic"]
+        self.enable_modality_attention = model_params["enable_modality_attention"]
 
-    # label smoothing
-    label_smoothing_enabled = model_params["label_smoothing_enabled"]
-    label_smoother = None
-    if label_smoothing_enabled:
-        alpha = model_params["label_smoothing_alpha"]
-        class_num = parameters["class_num"]
-        label_smoother = LabelSmoothing(class_num, alpha)
+        # mask params
+        mask_params = model_params["mask_parameters"]
+        self.mask_enabled = mask_params["mask"]
+        self.lambda_mask = mask_params["lambda_mask"]
+        self.mask_loss_type = mask_params["mask_loss_type"]
 
-    # mask loss selection
-    mask_criterion = mask_criterion_selector(parameters, method)
+        # label smoothing
+        label_smoothing_enabled = model_params["label_smoothing_enabled"]
+        if label_smoothing_enabled:
+            alpha = model_params["label_smoothing_alpha"]
+            class_num = parameters_dict["class_num"]
+            self.label_smoother = LabelSmoothing(class_num, alpha)
+        else:
+            self.label_smoother = None
 
-    # debug / viz flags
-    debug_training = parameters["debug_training"]
-    ENABLE_MASK_VIZ = debug_training
-    show_attention = debug_training
-    debug_first = debug_training
-    # prepare AMP scaler local to this training call
-    scaler = torch.cuda.amp.GradScaler()
+        # mask loss
+        self.mask_criterion = mask_criterion_selector(parameters_dict, method)
 
-    # best model bookkeeping
-    best_model_wts = copy.deepcopy(model.state_dict())
-    best_val_acc = -float("inf")
+        # debug
+        self.debug_training = parameters_dict["debug_training"]
+        self.debug_first = self.debug_training
 
-    # hook to be able to visualize modality weights
-    attention_hook = None
-    if show_attention and enable_modality_attention and hasattr(model, "modality_attention") and model.modality_attention is not None:
-        attention_hook = GetWeights(model.modality_attention.fc)
+        # attach attention hook if needed
+        self.attention_hook = None
+        if self.debug_training and self.enable_modality_attention and \
+           hasattr(model, "modality_attention") and model.modality_attention is not None:
+            self.attention_hook = GetWeights(self.model.modality_attention.fc)
 
-    # optional fixed batch for visualization
-    viz_inputs_cpu = viz_masks_cpu = viz_labels_cpu = None
-    num_viz_samples = 0
-    if ENABLE_MASK_VIZ and "val" in dataloaders and len(dataloaders["val"]) > 0:
-        example = next(iter(dataloaders["val"]))
-        if len(example) == 3:
-            viz_inputs_cpu, viz_masks_cpu, viz_labels_cpu = example
-        elif len(example) == 2:
-            viz_inputs_cpu, viz_labels_cpu = example
-            viz_masks_cpu = None
-        if viz_inputs_cpu is not None:
-            num_viz_samples = min(4, viz_inputs_cpu.size(0))
-            viz_inputs_cpu = viz_inputs_cpu[:num_viz_samples].cpu()
-            if viz_masks_cpu is not None:
-                viz_masks_cpu = viz_masks_cpu[:num_viz_samples].float().cpu()
-            if viz_labels_cpu is not None:
-                viz_labels_cpu = viz_labels_cpu[:num_viz_samples].cpu()
+        # used for visualization
+        self._prepare_viz_batch(dataloaders)
 
-    # histories
-    train_acc_history, train_loss_history, val_acc_history, val_loss_history = [], [], [], []
+        # metric objects (track averages across batches/epochs)
+        self.train_mask_dice = MeanMetric()
+        self.val_mask_dice = MeanMetric()
+        self.train_recon_loss = MeanMetric()
+        self.val_recon_loss = MeanMetric()
+        self.train_mimic_loss = MeanMetric()
+        self.val_mimic_loss = MeanMetric()
 
-    model.to(device)
+    # -------------------------
+    # prep viz batch
+    # ----------------
+    def _prepare_viz_batch(self, dataloaders):
+        self.viz_inputs_cpu = None
+        self.viz_masks_cpu = None
+        self.viz_labels_cpu = None
+        self.num_viz_samples = 0
 
-
-    #---------------------------------
-    # ---------- main loop -----------
-    #---------------------------------
-    start_time = time.time()
-    for epoch in range(num_epochs):
-        print(f"\n=== Epoch {epoch+1}/{num_epochs} ===")
-        for phase in ("train", "val"):
-            is_train = phase == "train"
-            if is_train:
-                model.train()
+        if self.debug_training and "val" in dataloaders and len(dataloaders["val"]) > 0:
+            example = next(iter(dataloaders["val"]))
+            if len(example) == 3:
+                vi, vm, vl = example
             else:
-                model.eval()
+                vi, vl = example
+                vm = None
 
-            running_loss = 0.0
-            running_corrects = 0
-            running_mask_dice = 0.0
-            mask_count = 0
-            per_class_correct = {}
-            per_class_count = {}
+            if vi is not None:
+                N = min(4, vi.size(0))
+                self.num_viz_samples = N
+                self.viz_inputs_cpu = vi[:N].cpu()
+                if vm is not None:
+                    self.viz_masks_cpu = vm[:N].float().cpu()
+                self.viz_labels_cpu = vl[:N].cpu()
+    #---
+    # get optimizer
+    #---
 
-            running_recon_loss = 0.0
-            running_mimic_loss = 0.0
+    def configure_optimizers(self):
+      return self.optimizer_fn(self.model.parameters())
 
-            # iterate batches
-            for batch_idx, batch in enumerate(dataloaders[phase]):
-                if len(batch) == 3:
-                    inputs, masks, labels = batch
-                elif len(batch) == 2:
-                    inputs, labels = batch
-                    masks = None
-                else:
-                    raise ValueError(f"Unexpected batch tuple length: {len(batch)}")
-
-                # move to device & type safety
-                inputs = inputs.float().to(device, non_blocking=True)
-                labels = labels.long().to(device, non_blocking=True)
-                if masks is not None:
-                    masks = masks.float().to(device, non_blocking=True)
-
-                # DEBUG: Print input stats for the first batch of the first epoch
-                if epoch == 0 and phase == 'train' and batch_idx < 5 and debug_first:
-                    print(f"[DEBUG] Input Stats: Min={inputs.min():.4f}, Max={inputs.max():.4f}, Mean={inputs.mean():.4f}, Std={inputs.std():.4f}")
-                    if masks is not None:
-                        print(f"[DEBUG] Mask Stats: Min={masks.min():.4f}, Max={masks.max():.4f}, Mean={masks.mean():.4f}")
+    # --------------------------------
+    # forward 
+    # --------------------------------
+    def forward(self, x, masks=None):
+        return self.model(x, masks)
 
 
-                # zero grads only in train
+    # --------------------------------
+    # shared step (train + val)
+    # --------------------------------
+    def _shared_step(self, batch, batch_idx, phase):
+        is_train = phase == "train"
+
+        # unpack
+        if len(batch) == 3:
+            inputs, masks, labels = batch
+        else:
+            inputs, labels = batch
+            masks = None
+
+        #ensure label dtype for classification
+        labels = labels.to(self.device)
+        labels = labels.long()
+        # DEBUG only first few
+        if self.current_epoch == 0 and batch_idx < 5 and self.debug_first and is_train:
+            print(f"[DEBUG] Input Stats: Min={inputs.min():.4f}, Max={inputs.max():.4f}, Mean={inputs.mean():.4f}, Std={inputs.std():.4f}")
+            if masks is not None:
+                print(f"[DEBUG] Mask Stats: Min={masks.min():.4f}, Max={masks.max():.4f}, Mean={masks.mean():.4f}")
+
+        # forward
+        outputs, aux, mask_output = self(inputs, masks)
+        recon_feats = aux.get("recon_feats", []) if aux is not None else []
+        proj_pairs = aux.get("proj_pairs", None) if aux is not None else None
+
+        # classification loss (label smoothing)
+        if self.label_smoother is not None and is_train:
+            smoothed = self.label_smoother(outputs, labels)
+            clf_loss = self.criterion_clf(outputs, smoothed)
+        else:
+            clf_loss = self.criterion_clf(outputs, labels)
+
+        batch_loss = clf_loss
+
+        # ----------------------
+        # mask losses 
+        # ----------------
+        if self.mask_enabled and mask_output is not None and masks is not None:
+            if mask_output.shape[-2:] != masks.shape[-2:]:
+                mask_out_resized = F.interpolate(mask_output,
+                                                 size=masks.shape[-2:],
+                                                 mode="bilinear",
+                                                 align_corners=False)
+            else:
+                mask_out_resized = mask_output
+
+            mask_loss = self.mask_criterion(mask_out_resized, masks)
+            batch_loss = batch_loss + self.lambda_mask * mask_loss
+
+            # dice metric
+            with torch.no_grad():
+                pred_bin = (torch.sigmoid(mask_out_resized) > 0.5).float()
+                gt_bin = (masks > 0.5).float()
+                inter = (pred_bin * gt_bin).sum(dim=(1, 2, 3))
+                union = pred_bin.sum(dim=(1, 2, 3)) + gt_bin.sum(dim=(1, 2, 3))
+                dice = ((2 * inter + 1e-6) / (union + 1e-6))  # per-sample dice
+
+                # update metrics
                 if is_train:
-                    optimizer.zero_grad(set_to_none=True)
+                    # update train mask dice total and count
+                    self.train_mask_dice.update(dice.mean())
+                else:
+                    self.val_mask_dice.update(dice.mean())
+        # ----------------
+        # recon + mimic
+        # -----------------
+        recon_loss_val = torch.tensor(0.0, device=self.device)
+        mimic_loss_val = torch.tensor(0.0, device=self.device)
 
-                # forward
-                with torch.set_grad_enabled(is_train):
-                    with torch.amp.autocast("cuda"):
-                        outputs, aux, mask_output = model(inputs, masks)
-                        # aux may contain proj_pairs and recon_feats
-                        recon_feats = aux.get("recon_feats", []) if aux is not None else []
-                        proj_pairs = aux.get("proj_pairs", None) if aux is not None else None
+        if self.recon_enabled:
+            for idx_r, r in enumerate(recon_feats):
+                if r is None:
+                    continue
 
-                        # check shape match
-                        if outputs.size(0) != labels.size(0):
-                            print(f"Warning: output batch ({outputs.size(0)}) != labels ({labels.size(0)}) — skipping batch.")
-                            continue
+                pred_r = r
+                if idx_r == 0:
+                    target = inputs
+                else:
+                    target = F.interpolate(inputs, scale_factor=1 / (2 ** idx_r),
+                                           mode="bilinear", align_corners=False)
 
-                        # classification loss (label smoothing if provided)
-                        if label_smoother is not None and is_train:
-                            smoothed = label_smoother(outputs, labels)
-                            clf_loss = criterion_clf(outputs, smoothed) 
-                        else:
-                            clf_loss = criterion_clf(outputs, labels)
+                if pred_r.size(1) == 1 and target.size(1) > 1:
+                    target_used = target.mean(dim=1, keepdim=True)
+                else:
+                    target_used = target
 
-                        batch_loss = clf_loss
+                if pred_r.shape[-2:] != target_used.shape[-2:]:
+                    pred_r = F.interpolate(pred_r,
+                                           size=target_used.shape[-2:],
+                                           mode="bilinear",
+                                           align_corners=False)
 
-                        # mask losses & metrics
-                        if mask_output is not None and mask_enabled:
-                            # handle shape mismatch by resizing predicted mask to gt size
-                            if mask_output is None:
-                                print("Warning: mask enabled but model returned no mask_output")
-                            else:
-                                if mask_output.shape[-2:] != masks.shape[-2:]:
-                                    mask_out_resized = F.interpolate(mask_output, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-                                else:
-                                    mask_out_resized = mask_output
+                recon_loss_val = recon_loss_val + recon_image_loss(pred_r, target_used)
 
-                                mask_loss = mask_criterion(mask_out_resized, masks)
-                                batch_loss = batch_loss + lambda_mask * mask_loss
+            # mimic
+            if self.mimic_enabled and proj_pairs is not None and len(proj_pairs) >= 4:
+                p1, p1_r, p2, p2_r = proj_pairs[:4]
+                mimic_loss_val = mimic_feat_loss(p1, p1_r) + mimic_feat_loss(p2, p2_r)
+                batch_loss = batch_loss + self.lambda_mimic * mimic_loss_val
 
-                                # dice metric (hard threshold) aggregated
-                                with torch.no_grad():
-                                    pred_bin = (torch.sigmoid(mask_out_resized) > 0.5).float()
-                                    gt_bin = (masks > 0.5).float()
-                                    inter = (pred_bin * gt_bin).sum(dim=(1,2,3))
-                                    union = pred_bin.sum(dim=(1,2,3)) + gt_bin.sum(dim=(1,2,3))
-                                    per_sample_dice = ((2. * inter + 1e-6) / (union + 1e-6)).cpu()
-                                    running_mask_dice += per_sample_dice.sum().item()
-                                    mask_count += inputs.size(0)
+            batch_loss = batch_loss + self.lambda_recon * recon_loss_val
 
-                        # recon & mimic
-                        recon_loss_val = torch.tensor(0.0, device=device)
-                        mimic_loss_val = torch.tensor(0.0, device=device)
-                        if recon_enabled:
-                            # recon_feats expected to be list like [r1, r2]
-                            # compute recon_loss by comparing decoded preds to inputs 
-                            for idx_r, r in enumerate(recon_feats):
-                                if r is None:
-                                    continue
-                                pred_r = r
-                                # choose target: full-size or half-size depending on index
-                                if idx_r == 0:
-                                    target = inputs
-                                else:
-                                    target = F.interpolate(inputs, scale_factor=1 / (2 ** idx_r), mode="bilinear", align_corners=False)
-                                # if pred channel == 1 but target has many channels, average
-                                if pred_r.size(1) == 1 and target.size(1) > 1:
-                                    target_used = target.mean(dim=1, keepdim=True)
-                                else:
-                                    target_used = target
-
-                                if pred_r.shape[-2:] != target_used.shape[-2:]:
-                                    pred_r = F.interpolate(pred_r, size=target_used.shape[-2:], mode="bilinear", align_corners=False)
-
-                                
-                                recon_loss_val = recon_loss_val + recon_image_loss(pred_r, target_used)
-
-                            # mimic loss from proj_pairs (p1, p1_r, p2, p2_r)
-                            if mimic_enabled and proj_pairs is not None and len(proj_pairs) >= 4:
-                                p1, p1_r, p2, p2_r = proj_pairs[:4]
-                                mimic_loss_val = mimic_feat_loss(p1, p1_r) + mimic_feat_loss(p2, p2_r)
-                                batch_loss = batch_loss + lambda_mimic * mimic_loss_val
-
-                            batch_loss = batch_loss + lambda_recon * recon_loss_val
-                            running_recon_loss += recon_loss_val.item() * inputs.size(0)
-                            running_mimic_loss += mimic_loss_val.item() * inputs.size(0)
-
-                        # end with batch_loss (tensor)
-                    # end autocast
-
-                    # backward + step when training
-                    if is_train:
-                        if torch.isnan(batch_loss) or torch.isinf(batch_loss):
-                            print("Warning: NaN or Inf loss encountered; skipping backward for this batch.")
-                        else:
-                            scaler.scale(batch_loss).backward()
-                            # optional gradient clipping 
-                            max_norm = float(model_params.get("grad_clip", 0.0))
-                            if max_norm > 0:
-                                scaler.unscale_(optimizer)  # required before clip_grad_norm_
-                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-                            scaler.step(optimizer)
-                            scaler.update()
-
-                # compute predictions / metrics on CPU to avoid GPU memory holding
-                with torch.no_grad():
-                    _, preds = torch.max(outputs, dim=1)
-                    running_corrects += torch.sum(preds == labels).item()
-
-                    # per-class stats
-                    labels_cpu = labels.cpu().numpy()
-                    preds_cpu = preds.cpu().numpy()
-                    for cls in np.unique(labels_cpu):
-                        cls = int(cls)
-                        per_class_count.setdefault(cls, 0)
-                        per_class_correct.setdefault(cls, 0)
-                    for l, p in zip(labels_cpu.tolist(), preds_cpu.tolist()):
-                        per_class_count[l] = per_class_count.get(l, 0) + 1
-                        if p == l:
-                            per_class_correct[l] = per_class_correct.get(l, 0) + 1
-
-                # accumulate loss (use batch_loss.item only after gradients / scaler handled)
-                running_loss += (batch_loss.detach().item() * labels.size(0))
-
-                # free batch-level heavy tensors
-                del inputs, labels, masks, outputs, aux, mask_output
-                torch.cuda.empty_cache()
-            # end epoch loop over batches
-
-            # finalize epoch metrics
-            dataset_size = len(dataloaders[phase].dataset)
-            epoch_loss = running_loss / (dataset_size if dataset_size > 0 else 1.0)
-            epoch_acc = running_corrects / (dataset_size if dataset_size > 0 else 1.0)
-            epoch_mask_dice = (running_mask_dice / mask_count) if mask_count > 0 else 0.0
-
-            # recon / mimic averaged
-            if recon_enabled:
-                epoch_recon = running_recon_loss / (dataset_size if dataset_size > 0 else 1.0)
-                epoch_mimic = running_mimic_loss / (dataset_size if dataset_size > 0 else 1.0)
+            # update recon/mimic metrics (recon_loss_val is mean-per-batch; weight by batch size)
+            if is_train:
+                self.train_recon_loss.update(recon_loss_val.detach())
+                self.train_mimic_loss.update(mimic_loss_val.detach())
             else:
-                epoch_recon = None
-                epoch_mimic = None
+                self.val_recon_loss.update(recon_loss_val.detach())
+                self.val_mimic_loss.update(mimic_loss_val.detach())
+        # ------------------
+        # metrics
+        # ---------------------
+        with torch.no_grad():
+            _, preds = outputs.max(dim=1)
+            correct = (preds == labels).sum().item()
+            batch_size = labels.size(0)
 
-            print(f"{phase} Acc:{epoch_acc:.4f} Loss:{epoch_loss:.4f}")
-            # per-class print in deterministic order
-            class_keys = sorted(per_class_count.keys())
-            class_accs = [ (per_class_correct.get(k,0) / per_class_count[k]) if per_class_count[k]>0 else 0.0 for k in class_keys ]
-            print(f"{phase} per-class acc: {class_accs}")
-            print(f"{phase} mask Dice: {epoch_mask_dice:.4f}")
-            if epoch_recon is not None:
-                print(f"{phase} Recon Loss: {epoch_recon:.4f}")
-            if epoch_mimic is not None:
-                print(f"{phase} Mimic Loss: {epoch_mimic:.4f}")
+        # log (Lightning)
+        self.log(f"{phase}_loss", batch_loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"{phase}_acc", correct / batch_size, prog_bar=True, on_step=False, on_epoch=True)
+
+        # log metric objects (will be aggregated/reset by Lightning)
+        if is_train:
+            # log train epoch-level metrics
+            self.log("train_mask_dice", self.train_mask_dice, on_epoch=True, prog_bar=True)
+            self.log("train_recon_loss", self.train_recon_loss, on_epoch=True, prog_bar=True)
+            self.log("train_mimic_loss", self.train_mimic_loss, on_epoch=True, prog_bar=True)
+        else:
+            self.log("val_mask_dice", self.val_mask_dice, on_epoch=True, prog_bar=True)
+            self.log("val_recon_loss", self.val_recon_loss, on_epoch=True, prog_bar=True)
+            self.log("val_mimic_loss", self.val_mimic_loss, on_epoch=True, prog_bar=True)
+
+        return batch_loss
 
 
-            '''
-                      # DEBUG: Print recon stats first batch
-            if debug_first and epoch == 0 and batch_idx < 5 and phase == 'train':
-                print(f"[DEBUG] Recon Pred Stats: Min={r1_pred.min():.4f}, Max={r1_pred.max():.4f}, Mean={r1_pred.mean():.4f}")
-                print(f"[DEBUG] Recon Target Stats: Min={r1_target.min():.4f}, Max={r1_target.max():.4f}, Mean={r1_target.mean():.4f}")
-            '''
-                        
+    # -----------------
+    # Lightning training_step
+    # -----------------
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, batch_idx, "train")
 
-            # bookkeeping best
-            if phase == "val":
-                val_acc_history.append(epoch_acc)
-                val_loss_history.append(epoch_loss)
-                if epoch_acc >= best_val_acc:
-                    best_val_acc = epoch_acc
-                    best_model_wts = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            else:
-                train_acc_history.append(epoch_acc)
-                train_loss_history.append(epoch_loss)
 
-            # attention hook printing
-            if phase == "train" and (epoch + 1) % 10 == 0 and attention_hook is not None and attention_hook.features is not None:
-                weights = attention_hook.features.mean(dim=0).detach().cpu().numpy()
-                print(f"Epoch {epoch+1} Modality Weights: {np.round(weights, 4).tolist()}")
+    # ------
+    # Lightning validation_step
+    # -------
+    def validation_step(self, batch, batch_idx):
+        loss = self._shared_step(batch, batch_idx, "val")
+        # visualize masks every N epochs
+        if self.debug_training and \
+           (self.current_epoch + 1) % VIZ_FREQUENCY == 0 and \
+           self.viz_inputs_cpu is not None and \
+           self.viz_masks_cpu is not None and \
+           batch_idx == 0:
+            visualize_masks_helper(
+                self.model,
+                self.viz_inputs_cpu,
+                self.viz_masks_cpu,
+                self.current_epoch,
+                self.num_viz_samples,
+                self.device,
+            )
 
-        # visualization of masks (val only)
-        if ENABLE_MASK_VIZ and (epoch + 1) % VIZ_FREQUENCY == 0 and viz_inputs_cpu is not None and viz_masks_cpu is not None:
-            visualize_masks_helper(model, viz_inputs_cpu, viz_masks_cpu, epoch, num_viz_samples, device)
+        return loss
 
-        # cleanup
-        gc.collect()
-        torch.cuda.empty_cache()
 
-    total_time = time.time() - start_time
-    print(f"Training complete in {int(total_time//60)}m {int(total_time%60)}s; Best val acc: {best_val_acc:.4f}")
+    # --------
+    #  lightning test step
+    # ---------
+    def test_step(self, batch, batch_idx):
+        inputs, labels = batch[0], batch[-1]
+        masks = batch[1] if len(batch) == 3 else None
 
-    # load best weights
-    model.load_state_dict(best_model_wts)
+        outputs, aux_dict, mask_output = self.model(inputs, masks)
 
-    if attention_hook is not None:
-        attention_hook.close()
+        preds = torch.argmax(outputs, dim=1)
+        acc = (preds == labels).float().mean()
 
-    return model, train_acc_history, train_loss_history, val_acc_history, val_loss_history
+        self.log("test_acc", acc, prog_bar=True)
+        return acc
+
+    # --------
+    # teardown hook
+    # ---------
+    def on_fit_end(self):
+        if self.attention_hook is not None:
+            self.attention_hook.close()
 
 
 # -------

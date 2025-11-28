@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from loss import *
+import pytorch_lightning as pl
 
 
 
@@ -58,8 +59,7 @@ def get_recon_loss(parameters, model_type):
         f"Invalid {model_type} reconstruction_loss_code '{reconstruction_loss_code}'. Only 'mse' supported."
     )
 
-
-# Classification optimizer selector / generator
+# Classification optimizer selector / generator old 
 def get_optimizer(model, parameters, model_type):
     optimizer_parameters =  parameters[f"{model_type}_model_parameters"]['optimizer_parameters']
     optimizer_type = optimizer_parameters['name'].lower()
@@ -85,6 +85,45 @@ def get_optimizer(model, parameters, model_type):
         raise ValueError(
             f"Invalid optimizer_type name '{optimizer_type}'. Valid options: ['adamW', 'adam']"
         )
+
+#lightning optimizer selector
+class LightningOptimizerFactory():
+
+    def __init__(self, model, parameters, model_type):
+          #super().__init__()
+          self.parameters = parameters
+          self.model= model
+          self.model_type = model_type
+          self.optimizer_fn  = self.get_optimizer()
+          
+    #def get_optimizer(self, model, parameters, model_type):
+    def get_optimizer(self):
+        #params unused
+        ___optimizer_parameters =  self.parameters[f"{self.model_type}_model_parameters"]['optimizer_parameters']
+        optimizer_type = ___optimizer_parameters['name'].lower()
+        if optimizer_type == "adamw":
+            return lambda params: torch.optim.AdamW(
+            params,
+            lr=___optimizer_parameters["lr"],
+            betas=___optimizer_parameters["betas"],
+            eps=___optimizer_parameters["eps"],
+            weight_decay=___optimizer_parameters["weight_decay"],
+            amsgrad=___optimizer_parameters["amsgrad"],
+        )
+        elif optimizer_type == "adam":
+            return  lambda params: torch.optim.Adam(
+            params,
+            lr=___optimizer_parameters["lr"],
+            betas=___optimizer_parameters["betas"],
+            eps=___optimizer_parameters["eps"],
+            weight_decay=___optimizer_parameters["weight_decay"],
+            amsgrad=___optimizer_parameters["amsgrad"],
+        )
+        else:
+            raise ValueError(
+                f"Invalid optimizer_type name '{optimizer_type}'. Valid options: ['adamW', 'adam']"
+            )
+
 
 # Mask loss classication criterion selector
 def mask_criterion_selector(parameters, model_type): 

@@ -10,7 +10,7 @@ from model_module import *
 
 #    Runs full fusion training using prepared models + dataloaders.
 
-def prepare_fusion_model(dwi_key, dce_key,dce_backbone, dwi_backbone, fold, parameters, device, method = 'fusion'):
+def prepare_fusion_model(dwi_results, dce_results,fold, parameters, device, method = 'fusion'):
 
     # ------ 
     # basic setup
@@ -76,10 +76,15 @@ def prepare_fusion_model(dwi_key, dce_key,dce_backbone, dwi_backbone, fold, para
     # -----
     #  Build models
     # -----
+     
+    dwi_model = dwi_results["trained_model"]
+    dce_model = dce_results["trained_model"]
+
+    '''
     dwi_params = parameters["dwi_model_parameters"] 
     dce_params = parameters["dce_model_parameters"]
 
-
+    
     dwi_model = initialize_model(
         ModelMaskHeadBackbone(parameters['dwi_channel_num'], class_num, dwi_params['channels'], dwi_params['proj_dim'], dwi_params['enable_modality_attention'], dwi_params['use_se'], dwi_backbone),
         requires_grad=True
@@ -91,16 +96,15 @@ def prepare_fusion_model(dwi_key, dce_key,dce_backbone, dwi_backbone, fold, para
         requires_grad=True
     )
     dce_model.load_state_dict(model_dict[dce_key])
-    
+    '''
 
     # -----------------------------
     # Build Fusion Model
     # -----------------------------
 
     # can't just load the params if using prebaked model
-    dwi_model_output_channels = infer_f3_channels(dwi_model, parameters['dwi_channel_num'], input_size=128)
-  
-    dce_model_output_channels = infer_f3_channels(dce_model, parameters['dce_channel_num'], input_size=128)
+    dwi_model_output_channels = infer_f3_channels(dwi_model, parameters['dwi_channel_num'], input_size=parameters['dwi_model_parameters']['input_size'])
+    dce_model_output_channels = infer_f3_channels(dce_model, parameters['dce_channel_num'], input_size=parameters['dce_model_parameters']['input_size'])
 
     fusion_params = parameters["fusion_model_parameters"]
 
