@@ -121,7 +121,7 @@ def run_fusion_model(dwi_model, dce_model, fusion_model, dataloaders, parameters
           classification_loss_method,
           device,
           parameters,
-          finetune = True
+          finetune = True,
         )
 
     # --------------

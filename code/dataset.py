@@ -7,26 +7,40 @@ import torch.nn.functional as F # Import F for resizing
 
 #todo make handle flexible channel counts
 class DWINormalize(object):
-    def __init__(self, train_min, train_max):
-        """
-        train_min, train_max: tensors of shape [C-1]
-        (ADC channel is excluded)
-        """
-        self.train_min = train_min
-        self.train_max = train_max
+    def __init__(self, clip_z=(-3, 3), adc = True):
+        self.z_lo, self.z_hi = clip_z
+        self.adc = adc
 
     def __call__(self, img):
-        # img: [C, H, W]
+        # img: C,H,W
         C, H, W = img.shape
-        out = img.clone()
-        # normalize all channels except last (ADC)
-        for ch in range(C - 1):
-            cmin = self.train_min[ch]
-            cmax = self.train_max[ch]
-            out[ch] = torch.clamp(out[ch], cmin, cmax)
-            out[ch] = (out[ch] - cmin) / (cmax - cmin + 1e-9)
+        out = torch.zeros_like(img)
+
+        # Do NOT normalize ADC
+        if self.adc: 
+          C -= 1
+
+        for ch in range(C):
+
+            x = img[ch]
+
+            # per-image Z-scoring
+            mean = x.mean()
+            std = x.std().clamp(min=1e-6)
+            x = (x - mean) / std
+
+            # clip z-scores
+            x = torch.clamp(x, self.z_lo, self.z_hi)
+
+            #map to [0,1]
+            x = (x - self.z_lo) / (self.z_hi - self.z_lo)
+
+            out[ch] = x
+
 
         return out
+
+
         
 #todo make handle flexible channel counts
 class DCENormalize(object):
@@ -58,9 +72,11 @@ class SingleInputDataset(torch.utils.data.Dataset):
         label = self.labels[index] if self.labels is not None else None
         mask = self.masks[index] if self.masks is not None else None
 
-
+        #print("DEBUG transform =", self.transforms)
+        #print("DEBUG img stats BEFORE transform:", img.min(), img.max(), img.mean())
         if self.transforms:
             img = self.transforms(img)
+        #print("DEBUG img stats after transform:", img[0].min(), img[0].max(), img[0].mean())
 
         if self.adc_map is not None:
           #rescale adc map as the image has been rescaled

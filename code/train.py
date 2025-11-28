@@ -127,7 +127,7 @@ def train_model(model, dataloaders, method, criterion_clf, criterion_recon, opti
                     masks = masks.float().to(device, non_blocking=True)
 
                 # DEBUG: Print input stats for the first batch of the first epoch
-                if epoch == 0 and batch_idx == 0 and phase == 'train' and debug_first:
+                if epoch == 0 and phase == 'train' and batch_idx < 5 and debug_first:
                     print(f"[DEBUG] Input Stats: Min={inputs.min():.4f}, Max={inputs.max():.4f}, Mean={inputs.mean():.4f}, Std={inputs.std():.4f}")
                     if masks is not None:
                         print(f"[DEBUG] Mask Stats: Min={masks.min():.4f}, Max={masks.max():.4f}, Mean={masks.mean():.4f}")
@@ -286,6 +286,15 @@ def train_model(model, dataloaders, method, criterion_clf, criterion_recon, opti
                 print(f"{phase} Recon Loss: {epoch_recon:.4f}")
             if epoch_mimic is not None:
                 print(f"{phase} Mimic Loss: {epoch_mimic:.4f}")
+
+
+            '''
+                      # DEBUG: Print recon stats first batch
+            if debug_first and epoch == 0 and batch_idx < 5 and phase == 'train':
+                print(f"[DEBUG] Recon Pred Stats: Min={r1_pred.min():.4f}, Max={r1_pred.max():.4f}, Mean={r1_pred.mean():.4f}")
+                print(f"[DEBUG] Recon Target Stats: Min={r1_target.min():.4f}, Max={r1_target.max():.4f}, Mean={r1_target.mean():.4f}")
+            '''
+                        
 
             # bookkeeping best
             if phase == "val":

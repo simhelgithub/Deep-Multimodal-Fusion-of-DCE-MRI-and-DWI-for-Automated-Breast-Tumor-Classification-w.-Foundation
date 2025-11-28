@@ -98,7 +98,7 @@ def prepare_single_custom_model(method, fold, parameters, device):
   special_normalizer = normalize_dce_dwi(method, imgs[0], parameters, device) # use training data for normalizer
 
   input_size = parameters[f"{method}_model_parameters"]["input_size"]
-  
+
   data_transforms = {
       "train": transforms.Compose([
           transforms.RandomAffine(degrees=90,translate=(0.1,0.1),shear=(0.1,0.1)),
@@ -235,14 +235,8 @@ def normalize_dce_dwi(method, training_imgs, parameters, debug = True, force_nyu
     if method == 'dwi':
       N, C, H, W = training_imgs.shape
       if parameters['dwi_add_adc_map']: 
-        C-=1 #avoid last channel, it is adc map and should be normalized separately
-      channel_mins = training_imgs[:, :-1].view(N, C, -1).min(dim=2)[0] 
-      channel_maxs = training_imgs[:, :-1].view(N, C, -1).max(dim=2)[0]
-
-      train_min = channel_mins.min(dim=0)[0]   # [C-1]
-      train_max = channel_maxs.max(dim=0)[0]
-      
-      specaial_normalizer = DWINormalize(train_min, train_max)
+        C-=1 #avoid last channel, it is adc map and should be normalized separately    
+      specaial_normalizer = DWINormalize()
 
     elif method == 'dce':
 
