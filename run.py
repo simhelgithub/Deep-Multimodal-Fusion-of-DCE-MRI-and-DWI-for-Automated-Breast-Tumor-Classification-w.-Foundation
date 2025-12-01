@@ -3,7 +3,7 @@ try:
     print("pytorch_lightning is already installed.")
 except ImportError:
     print("pytorch_lightning not found. Installing...")
-    !pip install pytorch_lightning --quiet
+    !pip install pytorch_lightning
     print("pytorch_lightning installed.")
 
 # ------------------------------
@@ -53,16 +53,29 @@ if device == "cpu":
 
 
 
+results = []
+
+for key, model_info in model_set.items():
+    result = run_training(parameters, device, key, dataloaders_dict[key], model, method)
+    results.append(result)
+
 # ------------------------------
 # TRAINING LOOP
 # ------------------------------
 
 for fold in range(segnum):
-
+  
+  #todo remove in time?
+  #dwi_key = None 
+  #dce_key = None 
+  #dwi_model = None
+  #dce_model = None
+  #todo optimize out
+  
+  
   train_labels = None
   dwi_results = None
   dce_results = None
-  fusion_results = None #todo remove?
 
   for method in methods:
       # ============================================================
@@ -77,7 +90,7 @@ for fold in range(segnum):
 
       print(f"\n==== Training {method.upper()} model for fold {fold+1}/{segnum} ====\n")
       results = run_single_model(fold, parameters, device, local_model, dataloaders_dict, key, method, train_labels)
-      
+
       #store fold models for fusion model
       if method == 'dwi':
         dwi_results = results
@@ -88,7 +101,7 @@ for fold in range(segnum):
 
   # ============================================================
   # 3. Prepare Fusion Model
-  # ============================================================
+  # ============================================================  
   print(f"\n= Preparing FUSION model for fold {fold+1}/{segnum} =\n")
 
   dataloaders_dict,dwi_model, dce_model, fusion_model = prepare_fusion_model(dwi_results, dce_results, fold, parameters, device)
@@ -101,13 +114,5 @@ for fold in range(segnum):
   run_fusion_model(dwi_model, dce_model, fusion_model, dataloaders_dict, parameters, device, fold, train_labels)
   print(f"\n==== Finished training FUSION model for fold {fold+1}/{segnum} ====\n")
 
-  #cleanup memory
-  del dataloaders_dict
-  del dwi_model
-  del dce_model
-  del fusion_model
-  del dwi_results
-  del dce_results
-  torch.cuda.empty_cache()
-  gc.collect()
+
 

@@ -8,14 +8,15 @@ from selector_helpers import *
 from model_test import *
 from train import *
 from train_fusion import *
+from debug_suite import *
 
 import json
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
 # Run single model, save the result
-def run_single_model(fold, parameters, device, local_model, dataloaders_dict, key, method, train_labels):
+def run_single_model(fold, parameters, device, local_model, dataloaders_dict, method, train_labels, name, version):
 
     # ----
     # Get classifcation loss method
@@ -27,58 +28,83 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, ke
     # ----
     reconstruction_loss_method = get_recon_loss(parameters, method)
 
-    # ----
-    # Select optimizer
-    # ----
-    optimizer_fn = LightningOptimizerFactory(local_model, parameters, method).get_optimizer()
-    # ----
-    # Train the model
-    # ----
 
     local_model = local_model.to(device)
       
     # recorder callback
-
-
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
     paths = prepare_output_paths(method, fold)
+
     logger = TensorBoardLogger(
         save_dir=paths["logs"], 
-        name="",
-        version='experiment' #temp disable 
+        name=name,
+        version=version
     )
 
+
+    # ---- EARLY STOPPING ----
+    early_params = parameters['early_stopping_parameters']
+    early_stop_cb = EarlyStopping(
+        monitor=early_params['metric'],
+        mode=early_params['mode'],
+        patience=early_params['patience'] ,
+        min_delta=early_params['min_delta'],
+        verbose=True
+    )
+
+    # ---- GET OPTIMIZER + SCHEDULER FROM YOUR FACTORY ----
+    factory = LightningOptimizerFactory(
+        model=local_model,
+        parameters=parameters,
+        model_type=method
+    )
+    optimizer_fn = factory.optimizer_fn
+    scheduler_fn = factory.scheduler_fn
+
+    # ---- BUILD LIGHTNING MODEL ----
     lightning_model = LightningSingleModel(
         model=local_model,
         method=method,
         criterion_clf=classification_loss_method,
         criterion_recon=reconstruction_loss_method,
-        optimizer_fn= optimizer_fn,
-        device = device,
+        optimizer_fn=optimizer_fn,
+        scheduler_fn=scheduler_fn,    # <--- ADD THIS
+        device=device,
         parameters_dict=parameters,
-        dataloaders= dataloaders_dict
+        dataloaders=dataloaders_dict
     )
+    # --- run debug
+    #if parameters['debug_training']:
+    #  run_debug_suite_single(lightning_model, method, parameters)
 
+    # ---- CHECKPOINT ----
     checkpoint_cb = ModelCheckpoint(
         dirpath=paths["checkpoints"],
         monitor="val_acc",
         mode="max",
         save_top_k=1,
         filename="best",
-        accelerator="gpu"
     )
+
+    # ---- TRAINER ----
     trainer = pl.Trainer(
-        callbacks=[checkpoint_cb],
+        callbacks=[
+            checkpoint_cb,
+            lr_monitor,
+            early_stop_cb
+        ],
         logger=logger,
         max_epochs=parameters["num_epochs"],
-        precision="16-mixed",     # AMP
+        precision=parameters['precision'],
     )
 
-    trainer.fit(lightning_model,
-                dataloaders_dict["train"],
-                dataloaders_dict["val"])
-
+    trainer.fit(
+        lightning_model,
+        dataloaders_dict["train"],
+        dataloaders_dict["val"]
+    )
     #results
+    
     best_model = LightningSingleModel.load_from_checkpoint(
         checkpoint_cb.best_model_path,
         model=local_model,
@@ -91,7 +117,6 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, ke
         dataloaders=dataloaders_dict,
     )    
 
-
     # ----
     # Test the model
     # ----
@@ -103,7 +128,6 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, ke
 
 
     return {
-    "model_name": key,
     "best_checkpoint": checkpoint_cb.best_model_path,
     "trained_model": best_model.cpu(),    # CPU to reduce GPU memory
     "train_metrics": trainer.callback_metrics,

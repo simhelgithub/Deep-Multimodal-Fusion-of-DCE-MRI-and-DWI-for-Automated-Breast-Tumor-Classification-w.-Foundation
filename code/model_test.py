@@ -5,6 +5,7 @@ import copy
 import torch.nn as nn
 import torch.nn.functional as F
 
+'''
 
 def single_model_test(model, dataloaders, device,parameters):
 
@@ -85,16 +86,6 @@ def single_model_test(model, dataloaders, device,parameters):
          epoch_acc3 = class3_corrects / class3num if class3num > 0 else 0
          print("test acc: [{}, {}, {}, {}]".format(epoch_acc0, epoch_acc1,epoch_acc2,epoch_acc3))
 
-    '''
-    # we never have test masks
-    if mask_sample_count > 0:
-        epoch_mask_dice = running_mask_dice / mask_sample_count
-        print("test mask Dice: {}".format(epoch_mask_dice))
-        # Combined accuracy
-        if labels is not None and num_samples > 0:
-             epoch_combined_score = (epoch_acc + epoch_mask_dice) / 2
-             print("test Combined Score: {}".format(epoch_combined_score))
-    '''
 
     time_elapsed = time.time() - since
     print("Testing complete in {}m {}s".format(time_elapsed // 60, time_elapsed % 60))
@@ -102,7 +93,7 @@ def single_model_test(model, dataloaders, device,parameters):
     #free mem
     del outputs, inputs
     torch.cuda.empty_cache()
-
+'''
 
 #mask _fusion always false and not tested
 def fusion_model_test(dwi_model, dce_model, fusion_model, dataloaders, device, mask_fusion=False):

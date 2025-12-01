@@ -118,7 +118,6 @@ def prepare_single_custom_model(method, fold, parameters, device):
     }
 
 
-
   # ----------
   # Process datasets
   # ---------
@@ -172,7 +171,6 @@ def prepare_single_custom_model(method, fold, parameters, device):
             masks=None,  #skip here already stored in dwi 
             labels=None  #skip here already stored in dwi 
         )
-
 
 
   return local_model, dataloaders_dict, key, labels[0], backbone

@@ -48,7 +48,7 @@ class ResNetLiteBlock_withRecon(nn.Module):
     recon_ch: if 0 -> reconstruction disabled; >0 -> produce recon_ch-channel reconstruction map
     use_se: apply SEBlock on output (lightweight)
     """
-    def __init__(self, in_ch, out_ch, downsample=False, recon_ch=1, use_se=False, se_reduction=2):
+    def __init__(self, in_ch, out_ch, downsample=False, recon_ch=1, use_se=False, se_reduction=2, dropout=0.3):
         super().__init__()
         stride = 2 if downsample else 1
         mid_ch = max(out_ch // 2, 1) # can be changed 
@@ -60,6 +60,7 @@ class ResNetLiteBlock_withRecon(nn.Module):
         self.conv3 = nn.Conv2d(mid_ch, out_ch, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(out_ch)
         self.act = nn.ELU(inplace=True)
+        self.dropout = nn.Dropout(p = dropout)
 
         self.skip = None
         if stride > 1 or in_ch != out_ch:
@@ -83,6 +84,7 @@ class ResNetLiteBlock_withRecon(nn.Module):
         if self.skip is not None:
             identity = self.skip(x)
         out = self.act(out + identity)
+        out = self.dropout(out) 
         if self.use_se:
             out = self.se(out)
         f_rec = self.reconstruct(out) if self.reconstruct is not None else None
@@ -289,8 +291,8 @@ class FusionModel(nn.Module):
                  num_classes=4,
                  fusion_recon_ch=1,
                  use_se_in_fusion=False,
-                 encoder_out_channels=None # optional: if provided, tuple (dwi_f3_ch, dce_f3_ch)
-                 ):
+                 encoder_out_channels=None, # optional: if provided, tuple (dwi_f3_ch, dce_f3_ch)
+                 dropout = 0.3):
         """
         encoder_out_channels: (dwi_f3_ch, dce_f3_ch) if encoder top features don't already match fusion_channels
         """
@@ -324,6 +326,7 @@ class FusionModel(nn.Module):
             nn.Conv2d(fusion_channels, fusion_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(fusion_channels),
             nn.ELU(inplace=True),
+            nn.Dropout(p = dropout),
             nn.Conv2d(fusion_channels, fusion_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(fusion_channels),
         )

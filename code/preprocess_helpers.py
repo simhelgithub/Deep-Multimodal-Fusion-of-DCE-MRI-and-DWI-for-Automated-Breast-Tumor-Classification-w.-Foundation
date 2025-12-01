@@ -2,48 +2,6 @@
 import torch as torch
 import numpy as np
 
-'''
-def preprocess_dwi(dwi_tensor, parameters,
-                   clip_z=(-3, 3)):    
-    """
-    DWI preprocessing tha
-
-    Guarantees:
-        - Stable approx mean/std before clipping
-        - Preserves relative z-score 
-    """
-
-    C, H, W = dwi_tensor.shape
-    out = torch.zeros_like(dwi_tensor)
-
-    if parameters['dwi_add_adc_map']: 
-      C-= 1 #don't normalize adc channel here
-
-    z_lo, z_hi = clip_z
-
-    for c in range(C):
-        ch = dwi_tensor[c]
-
-        # Step 1 — Z-score
-        mean = ch.mean()
-        std = ch.std()
-        if std < 1e-6:
-            std = 1e-6
-        ch = (ch - mean) / std
-
-        # Step 2 — Clip z-scores (preserves structure)
-        ch = torch.clamp(ch, z_lo, z_hi)
-
-        # Step 3 — Map to [0, 1]
-        ch = (ch - z_lo) / (z_hi - z_lo)
-
-
-        out[c] = ch
-
-    return out
-
-'''
-
 def preprocess_dce(dce_tensor, nyul_model, apply_zscore=False):
     """
     dce_tensor: [C, H, W]
@@ -82,18 +40,10 @@ def preprocess_adc(adc_map):
     """
     adc_map: [1, H, W]
     """
-    #adc = adc_map.clone()
 
-    # (1) log-transform to compress outliers
+    # log-transform to compress outliers
     adc = torch.log1p(adc_map.clamp(min=0))
 
-    # (2) z-score
-    #mean = adc.mean()
-    #std = adc.std()
-    #if std < 1e-6:
-    #    std = 1e-6
-    #adc = (adc - mean) / std
-    
     adc = normalize_adc(adc)
 
     return adc
