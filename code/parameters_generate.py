@@ -7,6 +7,10 @@ parameters={}
 # Core Training parameters
 # ---
 parameters['debug_training'] = True
+parameters['debug_val'] = parameters['debug_training']
+parameters['backbone_debug'] = False
+parameters['full_debug'] = True #controls more verbose debugs
+
 
 
 #parameters['num_epochs']=1500
@@ -14,7 +18,7 @@ parameters['debug_training'] = True
 #parameters['batch_size']=32
 parameters['num_epochs']= 300
 parameters['finetune_num_epochs']=2
-parameters['batch_size']=64 
+parameters['batch_size']=32 
 #parameters['input_size']=32
 parameters['segnum']=5
 parameters['class_num']=4
@@ -24,11 +28,18 @@ parameters['namelist'] = ['train','val','test']
 
 
 
+
 #--
 # main control
 #--
 parameters['control_metric'] =  'val_roc_auc'
-parameters['patience'] = 20
+parameters['patience'] = 50
+
+#controlled elsewhere
+#parameters['version'] = 'experimental' #
+#parameters['name'] = ''
+
+parameters['save_dir'] = 'logs'
 
 #----
 # Single model specific parameters
@@ -40,12 +51,15 @@ parameters["dwi_model_parameters"] = {
 
     # --- base model info
     'input_size':128,
- 
+
     
     # ---- model structure ----
     "channels": (32, 64, 128),
-    "proj_dim": 64,
+    "proj_dim": 32,
     "use_se": False,
+    'grad_clip': 3,
+    'gradient_clip_algorithm':'norm', #alt, "norm" "value"
+  
     # ---- model features
     "enable_modality_attention": True,
     "backbone_str": 'resnet50',
@@ -57,7 +71,7 @@ parameters["dwi_model_parameters"] = {
 
     # ---- mimic loss ----
     "mimic_enabled": True,
-    "lambda_mimic": 1.0,
+    "lambda_mimic": 0.4,
 
     # ---- reconstruction loss ----
     "recon_enabled": True,
@@ -73,7 +87,7 @@ parameters["dwi_model_parameters"] = {
     # --- Mask parameters
     'mask_parameters' : {
       "mask": True,   #mask enabled for custom models
-      "lambda_mask": 1.0,
+      "lambda_mask": 0.4,
       "mask_loss_type": "dice",
       "mask_target_size": (32, 32),
       "mask_fusion_attention": True
@@ -81,15 +95,20 @@ parameters["dwi_model_parameters"] = {
     # --- optimizer parameters
     'optimizer_parameters' : {
       'name':"adamW", #or adam
-      "lr":0.001,
+      "lr": 5e-4,
+      #"lr":0.001,
       "betas":(0.9, 0.999),
       "eps":1e-08,
-      "weight_decay":0.0001,
+      #"weight_decay":0.0001,
       "amsgrad":False,
       "num_lr_groups": 3,
       "discriminative_lr": True,
-      "lr_decay_factor": 2.5,
-      "weight_decay": 0.01
+      "lr_decay_factor": 2,
+      "weight_decay": 0.001,
+      "discrim_on": "all", #options: all, backbone, non_backbone
+      "discriminative_reg": True,      
+      "reg_decay_factor": 2,     
+      "reg_base": 1e-4
     },
     'scheduler' : {
       'name' :"reduce_lr_on_plateau", #alts "cosine", "cosine_with_warmup", "reduce_lr_on_plateau"
@@ -108,6 +127,12 @@ parameters["dwi_model_parameters"] = {
       'max_steps' : 10000
 
     },
+    # regularization 
+    "attn_reg_enabled": True,
+    "lambda_attn_sparsity": 1e-4,
+    "lambda_attn_consistency": 1e-4,
+    "feat_norm_reg_enabled": True,
+    "lambda_feat_norm": 1e-4,
 
 
 }      
@@ -139,14 +164,16 @@ parameters["fusion_model_parameters"] = {
     
     # ---- model structure ----
     "channels": 128,
-    "proj_dim": 64,
+    "proj_dim": 32,
     "use_se": False,
     'fusion_channels':128,
     'token_pool': (4,4),
     "use_cross_attention":True,
     "use_mask_attention":True,
-    "mha_heads":4,
-    'grad_clip':5.0,
+    "mha_heads": 4,
+    'grad_clip': 3,
+    'gradient_clip_algorithm':'norm', #alt, "norm" "value"
+
     # ---- label smoothing ----
     "label_smoothing_enabled": True,
     "label_smoothing_alpha": 0.1,
@@ -163,8 +190,7 @@ parameters["fusion_model_parameters"] = {
       "weight_decay":0.0001,
       "amsgrad":False,
       "num_lr_groups": 3,
-      "lr_decay_factor": 2.5,
-      "weight_decay": 0.01
+      "lr_decay_factor": 2,
     },
 
     # ---- classification loss
@@ -205,7 +231,7 @@ parameters['early_stopping_parameters'] = {
 #--
 # AMP
 #---
-parameters['precision'] = "16-mixed"
+parameters['precision'] = "16-mixed" # "16-mixed" "bf16-mixed"
 #---
 # TTA and mc parameters
 #-- 
@@ -217,12 +243,16 @@ parameters['mc_passes'] = 10
 #--
 parameters['backbone_freeze_on_start'] = True
 parameters['backbone_num_groups'] = 3 #how many parts to split the backbone in for gradual unfreezing
-parameters['unfreeze_timer'] = 10
-#--
+parameters['unfreeze_timer'] = 30
+
+parameters['backbone_unfreeze_lr'] = parameters["dwi_model_parameters"]['optimizer_parameters']['lr'] * 0.1
+   
+parameters['backbone_unfreeze_lr_factor']=  0.25
+
 # Aux-Loss Scheduling
 #---
 parameters['use_simple_aux_loss_scheduling'] = True
-parameters["aux_loss_weight_epoch_limit"] = 50
+parameters["aux_loss_weight_epoch_limit"] = max(100 , parameters['unfreeze_timer']*(parameters['backbone_num_groups'] +2))
 
 
 #---
@@ -240,6 +270,15 @@ if parameters['dwi_add_adc_map']: parameters['dwi_channel_num']+=1
 
 parameters['dce_channel_num']= len(parameters['dce_channels_to_use'])
 
+#min epochs
+parameters['min_epochs'] =  max(parameters['patience']*3, parameters['num_epochs'])
+
+if parameters['backbone_freeze_on_start']:
+  parameters['min_epochs'] = max(parameters['min_epochs'], parameters['unfreeze_timer']*(parameters['backbone_num_groups'] +1))
+
+if parameters['use_simple_aux_loss_scheduling']:
+  parameters['min_epochs']  = max(parameters['min_epochs'], parameters["aux_loss_weight_epoch_limit"]+1)
+parameters['min_epochs'] =  max(parameters['min_epochs'], parameters['num_epochs']/4) #min 1/4 of max epochs
 
 
 

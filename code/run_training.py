@@ -23,18 +23,18 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, me
     # ----
 
     classification_loss_method = get_classification_loss(parameters, train_labels, method, device)
-    # ----
-    # Selectors for reconstruction loss
-    # ----
-    reconstruction_loss_method = get_recon_loss(parameters, method)
 
 
+
+    # ---
+    # Lightning model setup
+    # ---
     local_model = local_model.to(device)
       
     # recorder callback
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
-    paths = prepare_output_paths(method, fold)
-
+    paths = prepare_output_paths(method, fold,parameters)
+  
     logger = TensorBoardLogger(
         save_dir=paths["logs"], 
         name=name,
@@ -66,16 +66,25 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, me
         model=local_model,
         method=method,
         criterion_clf=classification_loss_method,
-        criterion_recon=reconstruction_loss_method,
         optimizer_fn=optimizer_fn,
-        scheduler_fn=scheduler_fn,    # <--- ADD THIS
+        scheduler_fn=scheduler_fn,   
         device=device,
         parameters_dict=parameters,
-        dataloaders=dataloaders_dict
+        dataloaders=dataloaders_dict,
+        paths = paths
     )
-    # --- run debug
-    #if parameters['debug_training']:
-    #  run_debug_suite_single(lightning_model, method, parameters)
+    #--- run debug
+    if parameters['debug_training']:
+    
+      #Copy model for debug       
+      model_cpu = copy.deepcopy(lightning_model)
+      model_copy = model_cpu.to(device)
+
+      # Delete the temporary model so CUDA memory is freed
+
+      run_debug_suite_single(model_copy, method, parameters, device)
+      del model_copy
+      torch.cuda.empty_cache()
 
     # ---- CHECKPOINT ----
     checkpoint_cb = ModelCheckpoint(
@@ -85,7 +94,7 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, me
         save_top_k=1,
         filename="best",
     )
-
+ 
     # ---- TRAINER ----
     trainer = pl.Trainer(
         callbacks=[
@@ -95,8 +104,9 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, me
         ],
         logger=logger,
         max_epochs=parameters["num_epochs"],
-        precision=parameters['precision'],
-    )
+        min_epochs=parameters["min_epochs"],
+        precision=parameters['precision']
+        )
 
     trainer.fit(
         lightning_model,
@@ -110,11 +120,11 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, me
         model=local_model,
         method=method,
         criterion_clf=classification_loss_method,
-        criterion_recon=reconstruction_loss_method,
         optimizer_fn=optimizer_fn,
         device=device,
         parameters_dict=parameters,
         dataloaders=dataloaders_dict,
+        paths = paths,
     )    
 
     # ----
@@ -225,23 +235,32 @@ def run_fusion_model(dwi_model, dce_model, fusion_model, dataloaders, parameters
 #---
 #save helpers
 #---
-def prepare_output_paths(method, fold, base_dir="results"):
+#todo make more flexible?
+def prepare_output_paths(method, fold, parameters, base_dir="results"):
     """Create and return the folder structure for saving results."""
+
     root = os.path.join(base_dir, method, f"fold_{fold}")
+
+    # Build paths
     paths = {
         "root": root,
         "checkpoints": os.path.join(root, "checkpoints"),
-        "logs": os.path.join(root, "logs"),
+        "logs": os.path.join(root, parameters["save_dir"]),
         "metrics_json": os.path.join(root, "metrics.json"),
         "model_state": os.path.join(root, "model_state_dict.pth"),
     }
 
-    for p in paths.values():
-        if os.path.splitext(p)[1] == "":
-            os.makedirs(p, exist_ok=True)
+    # Create all directory paths
+    dirs_to_create = [
+        paths["root"],
+        paths["checkpoints"],
+        paths["logs"],
+    ]
+
+    for d in dirs_to_create:
+        os.makedirs(d, exist_ok=True)
 
     return paths
-
 
 def save_metrics(metrics_dict, path):
     """Save metrics to JSON."""

@@ -5,7 +5,7 @@ from torch.nn import init # Import the init module
 from loss import *
 
 
-dce_channel_count = 6
+dce_channel_count = 6 #todo fix to get from params
 dwi_channel_count = 13
 
 
@@ -30,14 +30,32 @@ class SEBlock(nn.Module):
             nn.ELU(inplace=True),
             nn.Conv2d(mid, channels, kernel_size=1, bias=True),
             nn.Sigmoid()
-        )
+        ) 
+        self.last_w = None #storage for use later
     def forward(self, x):
-        w = self.fc(x)
-        return x * w
+        self.last_w = self.fc(x)
+        return x * self.last_w, self.last_w
 
 # Convenience aliases for modality attentions
 class TemporalAttention(SEBlock): pass
 class ChannelAttention(SEBlock): pass
+
+
+class MaskGuidedSpatialAttention(nn.Module):
+    def __init__(self, in_channels_img, in_channels_mask):
+        super().__init__()
+        self.mask_processor = nn.Sequential(
+            nn.Conv2d(in_channels_mask, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+    def forward(self, img_features, mask_features):
+        if mask_features.shape[-2:] != img_features.shape[-2:]:
+            mask_up = F.interpolate(mask_features, size=img_features.shape[-2:], mode='bilinear', align_corners=False)
+        else:
+            mask_up = mask_features
+        attention_map = self.mask_processor(mask_up)
+        return img_features * attention_map, attention_map
+
 
 # -----------------------------
 # Residual Lite Block with reconstruction head
@@ -116,7 +134,7 @@ class ModelMaskHeadBackbone(nn.Module):
       - always predicts masks via mask_head
       - returns: logits, aux, f3, mask_pred
     """
-    def __init__(self, channel_num, num_classes=4, channels=(32,64,128), proj_dim=64, enable_modality_attention=False, use_se=False, backbone = None):
+    def __init__(self, channel_num, num_classes=4, channels=(32,64,128), proj_dim=32, enable_modality_attention=False, use_se=False, backbone = None):
         """
         channel_num: number of input channels (6 or 13 expected for enabling modality attention)
         enable_modality_attention: bool
@@ -132,6 +150,7 @@ class ModelMaskHeadBackbone(nn.Module):
         self.channel_num = channel_num
         c1, c2, c3 = channels
         self.enable_modality_attention = enable_modality_attention
+        self.proj_pool = nn.AdaptiveAvgPool2d((proj_dim, proj_dim))
 
         # Blocks with reconstruction
         # recon_ch=1 at stage1 and stage2; deep recon disabled at stage3
@@ -180,7 +199,7 @@ class ModelMaskHeadBackbone(nn.Module):
 
 
         if self.modality_attention is not None:
-            x_in = self.modality_attention(x_in)
+            x_in, mod_attn_map = self.modality_attention(x_in)
 
         f1, r1 = self.block1(x_in)  # f1 [B,c1,H,W], r1 [B,1,H,W]
 
@@ -196,7 +215,7 @@ class ModelMaskHeadBackbone(nn.Module):
 
         # Apply mask-guided attention after block2 (image features + mask features)
         # Use mask_spatial_attention to modulate f2 with f1 features (upsampled internally)
-        f2_att = self.mask_spatial_attention(f2, f1_for_mask)
+        f2_att, mask_attn_map  = self.mask_spatial_attention(f2, f1_for_mask)
 
         # Block3 on attended features
         f3, _ = self.block3(f2_att)
@@ -204,9 +223,16 @@ class ModelMaskHeadBackbone(nn.Module):
         # Mask prediction
         mask_pred = self.mask_head(f1_for_mask)  # shape approx input spatial size (depending on upsampling convtranspose)
 
-        # Projected features for mimic loss
-        p1, p1_r = self.proj_f1(f1), self.proj_r1(r1)
-        p2, p2_r = self.proj_f2(f2), self.proj_r2(r2)
+        # Projected features for mimic & recon loss
+        f1_p = self.proj_pool(f1)
+        f2_p = self.proj_pool(f2)
+        r1_p = self.proj_pool(r1)
+        r2_p = self.proj_pool(r2)
+
+        p1   = self.proj_f1(f1_p)
+        p2   = self.proj_f2(f2_p)
+        p1_r = self.proj_r1(r1_p)
+        p2_r = self.proj_r2(r2_p)
 
         raw_feats = [f1, f2, f3]
         recon_feats = [r1, r2]
@@ -225,12 +251,13 @@ class ModelMaskHeadBackbone(nn.Module):
             "raw_feats":raw_feats,
             "recon_feats":recon_feats,
             "proj_pairs":proj_pairs,
-            "mod_attn":mod_attn_features
+            "mod_attn_features":mod_attn_features,
+            "mask_attn_map": mask_attn_map,
+            "mod_attn_map": mod_attn_map
         }
 
 
         return classification_out, aux, mask_pred
-
 
 class MaskHeadSetSize(nn.Module):
     """
@@ -441,21 +468,6 @@ class FusionModel(nn.Module):
             "p_dce": p_dce
         }
         return logits, fused_mask_logits, aux
-
-class MaskGuidedSpatialAttention(nn.Module):
-    def __init__(self, in_channels_img, in_channels_mask):
-        super().__init__()
-        self.mask_processor = nn.Sequential(
-            nn.Conv2d(in_channels_mask, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-    def forward(self, img_features, mask_features):
-        if mask_features.shape[-2:] != img_features.shape[-2:]:
-            mask_up = F.interpolate(mask_features, size=img_features.shape[-2:], mode='bilinear', align_corners=False)
-        else:
-            mask_up = mask_features
-        attention_map = self.mask_processor(mask_up)
-        return img_features * attention_map
 
 def init_parameter(model):
     if isinstance(model, nn.Linear):

@@ -18,7 +18,7 @@ from preprocess_helpers import *
 
 def prepare_single_custom_model(method, fold, parameters, device):
 
-  warnings.filterwarnings('ignore')
+  #warnings.filterwarnings('ignore')
   
   batch_size = parameters['batch_size']  
   segnum = parameters['segnum']

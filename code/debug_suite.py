@@ -1,73 +1,210 @@
 import torch
-from train import *
+import torch.nn.functional as F
+from train import LightningSingleModel
 
 
-#wip
 
-def run_debug_suite_single(model_module: LightningSingleModel, method, parameters):
-    device = next(model_module.model.parameters()).device
+def run_debug_suite_single(model_module, method, parameters, device):
+    """
+    -runs the usual forward / shared step / MC / TTA checks
+    -and also computes the three regularizers
+    """
+    print("\n========== DEBUG SUITE (device={}) ==========".format(device))
 
-    print("\n========== DEBUG SUITE ==========")
-
-    # --- 1) Synthetic batch ---
-    model_params = parameters[f"{method}_model_parameters"]
-
-    B = 2
+    # ----- synthetic batch -----
+    params = parameters[f"{method}_model_parameters"]
+    B = 2  # small batch
     C = parameters[f"{method}_channel_num"]
-    H = model_params['input_size']
-    W = model_params['input_size']
+    H = params['input_size']
+    W = params['input_size']
 
     x = torch.randn(B, C, H, W, device=device)
-    mask = (torch.rand(B, 1, H, W, device=device) > 0.5).float()
+    masks = (torch.rand(B, 1, 32, 32, device=device) > 0.5).float()
     labels = torch.randint(0, model_module.class_num, (B,), device=device)
+    batch = (x, masks, labels)
 
-    batch = (x, mask, labels)
     print("Created synthetic batch.")
+    print("  x device:", x.device, " mask device:", masks.device, " labels device:", labels.device)
 
-    # --- 2) Forward pass ---
-    logits, aux, mask_pred = model_module.model(x, mask)
+    # ----- forward -----
+    out, aux, mask_pred = model_module(x, masks)
     print("Forward pass OK.")
-    print("  logits:", logits.shape)
-    print("  mask_pred:", None if mask_pred is None else mask_pred.shape)
+    print("  logits:", out.shape, " mask_pred:", None if mask_pred is None else mask_pred.shape)
+    print(f"[DEBUG] Input Stats: Min={x.min():.4f}, Max={x.max():.4f}, Mean={x.mean():.4f}, Std={x.std():.4f}")
+    print(f"[DEBUG] Mask Stats: Min={masks.min():.4f}, Max={masks.max():.4f}, Mean={masks.mean():.4f}")
 
-    # --- 3) Shared step (train) ---
+    # ----- shared step -----
     loss = model_module._shared_step(batch, 0, "train")
-    print("Shared step OK. Loss:", loss.item())
+    print("Shared step OK. Loss:", float(loss.item()))
 
-    # --- 4) MC Dropout ---
-    mean_mc, std_mc = model_module.predict_mc_dropout(model_module.model, x)
-    print("MC dropout OK. mean:", mean_mc.shape, "std:", std_mc.shape)
+    # ----- compute/inspect regularizers (robust) -----
+    print("\n--- Regularizers debug ---")
 
-    # --- 5) TTA ---
-    tta_pred = model_module.predict_tta(model_module.model, x)
-    print("TTA OK. out:", tta_pred.shape)
+    # Attention sparsity: prioritize explicit modality attention (aux['mod_attn']),
+    #    then mask attention map (aux['mask_attn_map']) if present, else skip.
+    attn_sparsity_val = None
+    if aux is not None:
+        if "mod_attn" in aux and aux["mod_attn"] is not None:
+            mod_attn = aux["mod_attn"]
+            # compute mean absolute activation as sparsity estimate
+            attn_sparsity_val = mod_attn.abs().mean().item()
+            print(f"Attention sparsity (mod_attn) = {attn_sparsity_val:.6g}  shape={tuple(mod_attn.shape)}")
+        elif "mask_attn_map" in aux and aux["mask_attn_map"] is not None:
+            mam = aux["mask_attn_map"]
+            attn_sparsity_val = mam.abs().mean().item()
+            print(f"Attention sparsity (mask_attn_map) = {attn_sparsity_val:.6g}  shape={tuple(mam.shape)}")
+        else:
+            print("Attention sparsity: no modality attention or mask-attn-map present -> skipped")
+    else:
+        print("Attention sparsity: aux is None -> skipped")
 
-    # --- 6) TTA + MC ---
-    tta_mc_mean, tta_mc_std = model_module.predict_tta_mc(model_module.model, x, passes=3)
-    print("TTA-MC OK. mean:", tta_mc_mean.shape)
+    # Quick sanity thresholds for sparsity
+    if attn_sparsity_val is not None:
+        if attn_sparsity_val > 1.0:
+            print("! Attention sparsity unusually large (>1.0) — may dominate loss.")
+        elif attn_sparsity_val < 1e-5:
+            print("! Attention sparsity essentially zero (<1e-5) — attention may be collapsed/suppressed.")
 
-    # --- 7) Predict custom ---
+    #Attention consistency: compare shallow (f1) vs deeper (f2) features in a robust pooled way
+    attn_consistency_val = None
+    if aux is not None and "raw_feats" in aux and aux["raw_feats"] is not None:
+        raw = aux["raw_feats"]
+        try:
+            f1, f2, f3 = raw[:3]  # expect list-like
+            # pool spatial dims to get per-channel vectors
+            f1_vec = F.adaptive_avg_pool2d(f1, (1, 1)).view(f1.size(0), -1)  # [B, C1]
+            f2_vec = F.adaptive_avg_pool2d(f2, (1, 1)).view(f2.size(0), -1)  # [B, C2]
+
+            # make sizes compatible by slicing to min channels (safe, deterministic)
+            minC = min(f1_vec.size(1), f2_vec.size(1))
+            f1_slice = f1_vec[:, :minC]
+            f2_slice = f2_vec[:, :minC]
+
+            # normalize per-sample
+            f1n = f1_slice / (f1_slice.norm(dim=1, keepdim=True) + 1e-6)
+            f2n = f2_slice / (f2_slice.norm(dim=1, keepdim=True) + 1e-6)
+
+            attn_consistency_val = F.mse_loss(f1n, f2n).item()
+            print(f"Attention consistency (pooled MSE f1 vs f2) = {attn_consistency_val:.6g}  (pooled dims: {minC})")
+        except Exception as e:
+            print("Attention consistency: failed to compute (bad shapes) ->", e)
+    else:
+        print("Attention consistency: raw_feats not present in aux -> skipped")
+
+    if attn_consistency_val is not None:
+        if attn_consistency_val > 1.0:
+            print("! Attention consistency loss large (>1.0) — features may be very different or exploding.")
+        elif attn_consistency_val < 1e-6:
+            print("! Attention consistency nearly zero (<1e-6) — features may be identical/collapsed.")
+
+    # 3) Feature-norm regularization: mean L2 / norm of each stage
+    feat_norm_val = None
+    if aux is not None and "raw_feats" in aux and aux["raw_feats"] is not None:
+        raw = aux["raw_feats"]
+        try:
+            vals = []
+            for i, f in enumerate(raw):
+                if f is None:
+                    continue
+                # compute per-feature average norm (per-sample)
+                # use: mean of L2 norms across channels/spatial -> scalar per-batch
+                per_sample_norm = f.pow(2).sum(dim=1).sqrt().view(f.size(0), -1).mean(dim=1)  # [B]
+                vals.append(per_sample_norm.mean().item())
+            if vals:
+                feat_norm_val = float(sum(vals) / len(vals))
+                print(f"Feature norm (mean L2 across stages) = {feat_norm_val:.6g}  per-stage={vals}")
+            else:
+                print("Feature norm: no raw_feats entries -> skipped")
+        except Exception as e:
+            print("Feature norm: failed to compute ->", e)
+    else:
+        print("Feature norm: raw_feats not present -> skipped")
+
+    if feat_norm_val is not None:
+        if feat_norm_val > 1e3:
+            print("! Feature norms very large (>1e3) — may lead to instability.")
+        elif feat_norm_val < 1e-6:
+            print("! Feature norms essentially zero (<1e-6) — possible collapse.")
+
+    # For further testing return dict 
+    reg_summary = {
+        "attn_sparsity": attn_sparsity_val,
+        "attn_consistency": attn_consistency_val,
+        "feat_norm": feat_norm_val,
+    }
+
+    # ===================================================================
+    # MC DROPOUT — VALIDATE VARIATION
+    # ===================================================================
+    mc_mean, mc_std = model_module.predict_mc_dropout(model_module.model, x, passes=6)
+    print("\nMC dropout OK. mean shape:", mc_mean.shape, " std shape:", mc_std.shape)
+
+    if mc_std.mean() < 0.0005:
+        print("! WARNING: MC dropout variance extremely small — dropout may NOT be active!")
+    else:
+        print("+ MC variance looks reasonable:", float(mc_std.mean()))
+    print("MC mean var:", float(mc_std.mean()))
+
+    # ===================================================================
+    # TTA — CHECK TRANSFORM EFFECT
+    # ===================================================================
+    base_pred = torch.softmax(out, dim=1)
+    tta_pred = model_module.predict_tta(model_module.model, x, masks)
+
+    diff = (tta_pred - base_pred).abs().mean()
+    print("\nTTA OK. out shape:", tta_pred.shape)
+
+    if diff < 1e-6:
+        print("! WARNING: TTA had almost no effect — transforms may not be applied!")
+    else:
+        print("+ TTA modifies predictions. Mean diff:", float(diff))
+
+    # ===================================================================
+    # TTA-MC — CHECK COMBINED VARIATION
+    # ===================================================================
+    tta_mc_mean, tta_mc_std = model_module.predict_tta_mc(model_module.model, x, masks, passes=4)
+    print("\nTTA-MC OK. mean shape:", tta_mc_mean.shape)
+
+    if tta_mc_std.mean() < mc_std.mean():
+        print("! WARNING: TTA-MC std < MC std — unexpected (may indicate broken TTA loop)!")
+    else:
+        print("+ TTA-MC variance > MC variance as expected.")
+
+    # ===================================================================
+    # predict_custom CROSS-CHECK
+    # ===================================================================
     pm = model_module.predict_custom(batch, mode="mc", mc_passes=3)
-    print("predict_custom(mc) OK")
-
     pt = model_module.predict_custom(batch, mode="tta")
-    print("predict_custom(tta) OK")
-
     ptm = model_module.predict_custom(batch, mode="tta_mc", mc_passes=3)
+
+    print("\npredict_custom(mc) OK")
+    print("predict_custom(tta) OK")
     print("predict_custom(tta_mc) OK")
 
-    # --- 8) Debug attention hook ---
-    if model_module.enable_modality_attention and model_module.attention_hook:
-        logits2, aux2, _ = model_module.model(x, mask)
-        feats = model_module.attention_hook.features
-        if feats is not None:
-            print("Attention hook OK. Features:", feats.shape)
-        else:
-            print("Attention hook did NOT capture features!")
 
-    # --- 9) Check metric objects ---
-    model_module.train_mask_dice.compute()
-    model_module.val_mask_dice.compute()
-    print("Metric objects operational.")
+    # Check consistency
+    diff = (pt - tta_pred).abs().mean().item()
+
+    if diff < 1e-3:
+        print(f"+ predict_custom(tta) matches predict_tta()   diff={diff:.4g}")
+    elif diff < 1e-2:
+        print(f"(!) Slight mismatch (acceptable): diff={diff:.4g}")
+    else:
+        print(f"X Large mismatch: diff={diff:.4g}")
+
+
+
+    # ===================================================================
+    # Mask Dice metric check
+    # ===================================================================
+    try:
+        model_module.train_mask_dice.compute()
+        model_module.val_mask_dice.compute()
+        print("\nMetric objects operational (compute() invoked).")
+    except Exception as e:
+        print("\n! Metric computation failed:", e)
 
     print("========== END DEBUG SUITE ==========\n")
+
+    return reg_summary
+
