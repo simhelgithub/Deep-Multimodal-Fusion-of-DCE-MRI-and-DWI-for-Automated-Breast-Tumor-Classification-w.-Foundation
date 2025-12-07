@@ -28,19 +28,15 @@ def prepare_fusion_model(dwi_results, dce_results,fold, parameters, device, meth
     # load in model data and put it in image_datasets
     # ---
     model_dict = torch.load(parameters['model_dict_path'])
-
-
     for idx, split in enumerate(namelist):
         '''
         data structure loaded
 
         [imgs, masks, labels]
         '''
-
         dwi_data[idx] = load_dataset_split(
             os.path.join(parameters['data_path'], f"dwi{fold}{split}data") #methodfoldsplitdata
         )
-
         dce_data[idx] = load_dataset_split(
             os.path.join(parameters['data_path'], f"dce{fold}{split}data")
         )
@@ -50,7 +46,6 @@ def prepare_fusion_model(dwi_results, dce_results,fold, parameters, device, meth
     # -----
     #  Build dataloaders
     # -----
-
     # prepare image datasets
     for idx, split in enumerate(namelist):
       current_masks = dwi_data[idx]['masks'] if (mask_parameters['mask'] and dwi_data[idx]['masks'] is not None) else None 
@@ -60,7 +55,6 @@ def prepare_fusion_model(dwi_results, dce_results,fold, parameters, device, meth
           masks=current_masks,
           labels=dwi_data[idx]['labels']  
       )
-
     #dataset to dataloder
     for idx, split in enumerate(namelist):
         dataloaders_dict[split] = torch.utils.data.DataLoader(
@@ -71,75 +65,23 @@ def prepare_fusion_model(dwi_results, dce_results,fold, parameters, device, meth
           collate_fn=custom_double_input_collate_fn
         )
 
-
-  
     # -----
     #  Build models
     # -----
-     
     dwi_model = dwi_results["trained_model"]
     dce_model = dce_results["trained_model"]
-
-    '''
-    dwi_params = parameters["dwi_model_parameters"] 
-    dce_params = parameters["dce_model_parameters"]
-
-    
-    dwi_model = initialize_model(
-        ModelMaskHeadBackbone(parameters['dwi_channel_num'], class_num, dwi_params['channels'], dwi_params['proj_dim'], dwi_params['enable_modality_attention'], dwi_params['use_se'], dwi_backbone),
-        requires_grad=True
-    )
-    dwi_model.load_state_dict(model_dict[dwi_key])
-    
-    dce_model = initialize_model(
-        ModelMaskHeadBackbone(parameters['dce_channel_num'], class_num, dce_params['channels'], dce_params['proj_dim'], dce_params['enable_modality_attention'], dce_params['use_se'], dce_backbone),
-        requires_grad=True
-    )
-    dce_model.load_state_dict(model_dict[dce_key])
-    '''
 
     # -----------------------------
     # Build Fusion Model
     # -----------------------------
-
-    # can't just load the params if using prebaked model
-    dwi_model_output_channels = infer_f3_channels(dwi_model, parameters['dwi_channel_num'], input_size=parameters['dwi_model_parameters']['input_size'])
-    dce_model_output_channels = infer_f3_channels(dce_model, parameters['dce_channel_num'], input_size=parameters['dce_model_parameters']['input_size'])
-
-    fusion_params = parameters["fusion_model_parameters"]
-
     fusion_model = FusionModel(
-        fusion_channels= fusion_params["channels"],
-        proj_dim=fusion_params["proj_dim"],
-        token_pool=fusion_params["token_pool"],
-        use_cross_attention=fusion_params["use_cross_attention"],
-        use_mask_attention=fusion_params["use_mask_attention"],
-        mha_heads=fusion_params["mha_heads"],
-        num_classes=class_num,
-        use_se_in_fusion=fusion_params["use_se"],
-        encoder_out_channels=(dwi_model_output_channels, dce_model_output_channels)
+        parameters
     )
-
     return dataloaders_dict,dwi_model, dce_model, fusion_model
 
 def load_dataset_split(load_path):
     data = torch.load(load_path)
     return data
-
-
-
-# assume dwi_encoder, dce_encoder already created
-def infer_f3_channels(encoder, in_channels, input_size=128):
-    enc_cpu = copy.deepcopy(encoder).cpu().eval()
-    with torch.no_grad():
-        dummy = torch.randn(1, in_channels, input_size, input_size)
-        _, aux, _ = enc_cpu(dummy, None)
-        recon_feats = aux['recon_feats']
-        raw_feats = aux['raw_feats']
-        f3 = raw_feats[-1]
-        ch = f3.shape[1]
-    del enc_cpu, dummy, raw_feats, recon_feats, aux
-    return ch
 
 
 

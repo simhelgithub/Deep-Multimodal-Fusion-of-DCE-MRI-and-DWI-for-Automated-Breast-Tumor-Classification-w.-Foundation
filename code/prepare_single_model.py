@@ -24,21 +24,21 @@ def prepare_single_custom_model(method, fold, parameters, device):
   segnum = parameters['segnum']
   class_num = parameters['class_num']
   bvals =  parameters['dwi_bvals_to_use']
-
+  dim = parameters['dim'] # 3d or 2d
+ 
   channels = parameters[f'{method}_model_parameters']["channels"] 
 
   backbone_str = parameters  [f'{method}_model_parameters']['backbone_str']
+
   proj_dim = parameters[f'{method}_model_parameters']['proj_dim'] 
   enable_modality_attention = parameters[f'{method}_model_parameters']["enable_modality_attention"] 
   use_se = parameters[f'{method}_model_parameters']["use_se"] 
   
   data_key_mod = parameters['data_key_mod']
   masks_path = parameters['masks_path']
+
   mask_parameters =  parameters[f'{method}_model_parameters']['mask_parameters']
   mask = mask_parameters['mask']
-
-
-
 
 
   #variables
@@ -88,9 +88,10 @@ def prepare_single_custom_model(method, fold, parameters, device):
   # --------
   # Backbone perparation
   # ---------
-  if (parameters[f"{method}_model_parameters"]["backbone_str"]) is not None: 
+  if (parameters[f"{method}_model_parameters"]["use_backbone"]): 
     backbone = build_medical_backbone(parameters, device=device, method=method, in_channels=channel_num)
-
+  else:
+    backbone = None
   #----
   # data transforms
   #----
@@ -133,18 +134,14 @@ def prepare_single_custom_model(method, fold, parameters, device):
   # Create Dataloader
   # -----
   for i in range(len(namelist)):
-    dataloaders_dict[namelist[i]] = torch.utils.data.DataLoader(image_datasets[namelist[i]], batch_size=batch_size, shuffle=(namelist[i] == 'train'), num_workers= 0,drop_last=False)
+    dataloaders_dict[namelist[i]] = torch.utils.data.DataLoader(image_datasets[namelist[i]], batch_size=batch_size, shuffle=(namelist[i] == 'train'), num_workers= parameters['dataloader_num_workers'],drop_last=False)
 
 
   # ------
   # Finally, create the model 
   # ----
 
-  local_model=initialize_model(ModelMaskHeadBackbone(channel_num, class_num, channels, proj_dim,  enable_modality_attention=enable_modality_attention, use_se = use_se, backbone = backbone),requires_grad=True)
-
-
-
-
+  local_model=initialize_model(ModelMaskHeadBackbone(method, parameters, backbone = backbone),requires_grad=True)
 
 
   #---

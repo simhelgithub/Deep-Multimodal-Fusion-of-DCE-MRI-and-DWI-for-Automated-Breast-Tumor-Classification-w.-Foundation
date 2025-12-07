@@ -12,7 +12,9 @@ def dice_bce_loss(pred_logits, target, bce_weight=1.0, dice_weight=1.0):
     bce = F.binary_cross_entropy_with_logits(pred_logits, target)
     dice = DiceLoss()(pred_logits, target)
     return bce_weight * bce + dice_weight * dice
-    
+
+'''
+ swapped for library function
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-6):
         super(DiceLoss, self).__init__()
@@ -31,7 +33,7 @@ class DiceLoss(nn.Module):
         dice = (2. * intersection + self.smooth) / (inputs.sum() + targets.sum() + self.smooth)
 
         return 1 - dice
-
+'''
 #note, will overwrite smoothed loss
 class FocalLoss(nn.Module):
     # Original FocalLoss implementation (scalar alpha)

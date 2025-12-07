@@ -157,7 +157,7 @@ def run_debug_suite_single(model_module, method, parameters, device):
     if diff < 1e-6:
         print("! WARNING: TTA had almost no effect — transforms may not be applied!")
     else:
-        print("+ TTA modifies predictions. Mean diff:", float(diff))
+        print("+ TTA modifies predictions. Mean diff:", float(diff.detach()))
 
     # ===================================================================
     # TTA-MC — CHECK COMBINED VARIATION
@@ -195,11 +195,11 @@ def run_debug_suite_single(model_module, method, parameters, device):
 
 
     # ===================================================================
-    # Mask Dice metric check
+    # Mask loss metric check
     # ===================================================================
     try:
-        model_module.train_mask_dice.compute()
-        model_module.val_mask_dice.compute()
+        model_module.train_mask_loss.compute()
+        model_module.val_mask_loss.compute()
         print("\nMetric objects operational (compute() invoked).")
     except Exception as e:
         print("\n! Metric computation failed:", e)
@@ -208,3 +208,6 @@ def run_debug_suite_single(model_module, method, parameters, device):
 
     return reg_summary
 
+#todo implement
+def run_debug_suite_fusion(model_module, method, parameters, device):
+  pass

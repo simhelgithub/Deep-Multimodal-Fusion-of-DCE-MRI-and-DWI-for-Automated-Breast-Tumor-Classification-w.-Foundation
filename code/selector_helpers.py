@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
+from torchmetrics.segmentation import DiceScore
 from loss import *
+from model_module import *
 import pytorch_lightning as pl
 
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
@@ -97,15 +98,18 @@ def mask_criterion_selector(parameters, model_type):
   mask_criterion = None
   if mask_enabled:
     if mask_loss_type == "dice":
-        mask_criterion = DiceLoss()
-    elif mask_loss_type == "BCE":
-        mask_criterion = nn.BCEWithLogitsLoss()
+        #mask_criterion = DiceLoss()
+        mask_criterion = DiceScore(num_classes=2, average='macro') #num classes 2
+   
     else:
         raise ValueError(f"Invalid mask loss: {mask_loss_type}")
-
+    ''' #no longer supported
+    elif mask_loss_type == "BCE":
+        mask_criterion = nn.BCEWithLogitsLoss()
+    '''
   return mask_criterion
 
-
+#todo split up a bit
 class LightningOptimizerFactory:
     """
     - Splits parameters into backbone vs non-backbone (by name prefix "backbone").
@@ -376,3 +380,214 @@ class LightningOptimizerFactory:
             wd = g.get("weight_decay", None)
             print(f"  ParamGroup {i}: count={cnt}  lr={lr}  wd={wd}")
         print("-"*60 + "\n")
+        
+        
+class LightningFusionOptimizerFactory:
+    """
+    Fusion-ready optimizer factory with full feature parity:
+    - Gradual unfreeze of DWI/DCE: backbone / block1+2 / block3
+    - Keeps fusion head always trainable
+    - Supports discriminative LR and weight decay
+    - Debug printing of parameter groups
+    - Scheduler support
+    """
+
+    def __init__(self, dwi_model: torch.nn.Module, dce_model: torch.nn.Module, fusion_model: torch.nn.Module, parameters: dict):
+        self.dwi_model = dwi_model
+        self.dce_model = dce_model
+        self.fusion_model = fusion_model
+        self.parameters = parameters
+
+        # Config knobs
+        self.num_backbone_groups = parameters.get("backbone_num_groups", 3)
+        self.backbone_freeze_on_start = parameters.get("backbone_freeze_on_start", True)
+
+        # Split DWI and DCE into gradual-unfreeze groups
+        self.dwi_named_groups = self.group_model_with_backbone_params(dwi_model)
+        self.dce_named_groups = self.group_model_with_backbone_params(dce_model)
+        self.fusion_named = list(fusion_model.named_parameters())  # always trainable
+
+        # Prepare un-named param lists for convenience
+        self.dwi_groups = [[p for (_, p) in g] for g in self.dwi_named_groups[:-1]]  # ignore head
+        self.dce_groups = [[p for (_, p) in g] for g in self.dce_named_groups[:-1]]  # ignore head
+        self.fusion_params = [p for (_, p) in self.fusion_named]
+
+        # Freeze DWI/DCE backbones if requested
+        if self.backbone_freeze_on_start:
+            self._freeze_all_backbone_groups()
+
+        # Build optimizer + scheduler factories
+        self.optimizer_fn = self._build_optimizer()
+        self.scheduler_fn = self._build_scheduler()
+
+    # ---------------------
+    # Parameter grouping
+    # ---------------------
+    @staticmethod
+    def group_model_with_backbone_params(model):
+        """
+        Return named parameter groups for gradual unfreezing:
+        - backbone
+        - block1 + block2
+        - block3
+        - head: classification/mask/projectors
+        """
+        backbone_params, shallow_params, deep_params, head_params = [], [], [], []
+
+        for name, p in model.named_parameters():
+            if name.startswith("backbone") or name.startswith("backbone_neck"):
+                backbone_params.append((name, p))
+            elif name.startswith("block1") or name.startswith("block2"):
+                shallow_params.append((name, p))
+            elif name.startswith("block3"):
+                deep_params.append((name, p))
+            elif (name.startswith("classification_head") or
+                  name.startswith("mask_head") or
+                  name.startswith("proj_f") or
+                  name.startswith("proj_r") or
+                  name.startswith("mask_spatial_attention")):
+                head_params.append((name, p))
+            else:
+                head_params.append((name, p))  # catch any others
+        return [backbone_params, shallow_params, deep_params, head_params]
+
+    # ---------------------
+    # Freeze/unfreeze helpers
+    # ---------------------
+    def _freeze_all_backbone_groups(self):
+        for group in self.dwi_groups + self.dce_groups:
+            for p in group:
+                p.requires_grad = False
+
+    def _unfreeze_group(self, group):
+        cnt = 0
+        for p in group:
+            if not p.requires_grad:
+                p.requires_grad = True
+                cnt += 1
+        return cnt
+
+    def gradual_unfreeze(self, epoch, unfreeze_every_n_epochs=2):
+        group_idx = epoch // unfreeze_every_n_epochs
+        group_idx = self.num_backbone_groups - 1 - group_idx  # deep -> shallow
+
+        if 0 <= group_idx < self.num_backbone_groups:
+            cnt_dwi = self._unfreeze_group(self.dwi_groups[group_idx])
+            cnt_dce = self._unfreeze_group(self.dce_groups[group_idx])
+            print(f"[INFO] Epoch {epoch}: Unfroze DWI group {group_idx} ({cnt_dwi} params), "
+                  f"DCE group {group_idx} ({cnt_dce} params)")
+
+    # ---------------------
+    # Base optimizer builder
+    # ---------------------
+    def _get_base_optimizer(self, params, cfg):
+        opt_name = cfg["optimizer_parameters"]["name"].lower()
+        p = cfg["optimizer_parameters"]
+        if opt_name == "adamw":
+            return torch.optim.AdamW(params, lr=p["lr"], eps=p["eps"], betas=p["betas"],
+                                     amsgrad=p.get("amsgrad", False), weight_decay=p["weight_decay"])
+        elif opt_name == "adam":
+            return torch.optim.Adam(params, lr=p["lr"], eps=p["eps"], betas=p["betas"],
+                                     amsgrad=p.get("amsgrad", False), weight_decay=p["weight_decay"])
+        else:
+            raise ValueError(f"Unsupported optimizer: {opt_name}")
+
+    # ---------------------
+    # Build optimizer
+    # ---------------------
+    def _build_optimizer(self):
+        cfg = self.parameters["fusion_model_parameters"]
+        p = cfg["optimizer_parameters"]
+        use_discriminative_lr = p.get("discriminative_lr", False)
+
+        if not use_discriminative_lr:
+            return lambda params: self._get_base_optimizer(params, cfg)
+
+        num_groups = p.get("num_lr_groups", self.num_backbone_groups)
+        lr_decay_factor = p.get("lr_decay_factor", 2.0)
+        weight_decay = p.get("weight_decay", 0.0)
+        base_lr = p.get("lr", 1e-3)
+
+        use_discriminative_reg = p.get("discriminative_reg", False)
+        reg_base = p.get("reg_base", weight_decay)
+        reg_decay_factor = p.get("reg_decay_factor", 2.0)
+
+        # Combine all named groups for discriminative LR
+        all_named_groups = self.dwi_named_groups[:-1] + self.dce_named_groups[:-1]  # backbone blocks only
+        all_named_groups.append(self.fusion_named)  # head always trainable
+
+        param_groups = []
+        n_groups = len(all_named_groups)
+        for i, named_group in enumerate(all_named_groups):
+            trainable = [p for (n, p) in named_group if p.requires_grad]
+            if not trainable:
+                continue
+            lr = base_lr / (lr_decay_factor ** (n_groups - 1 - i))
+            wd = reg_base * (reg_decay_factor ** (n_groups - 1 - i)) if use_discriminative_reg else weight_decay
+            param_groups.append({"params": trainable, "lr": lr, "weight_decay": wd})
+
+        # Fallback
+        if not param_groups:
+            all_trainable = [p for g in all_named_groups for (_, p) in g if p.requires_grad]
+            param_groups = [{"params": all_trainable, "lr": base_lr, "weight_decay": weight_decay}]
+
+        self.print_param_group_summary(param_groups, tag="FINAL FUSION PARAM GROUPS")
+        return lambda _: self._get_base_optimizer(param_groups, cfg)
+
+    # ---------------------
+    # Scheduler
+    # ---------------------
+    def _build_scheduler(self):
+        cfg = self.parameters["fusion_model_parameters"]
+        sch_cfg = cfg.get("scheduler", None)
+        if sch_cfg is None:
+            return None
+
+        name = sch_cfg["name"].lower()
+        if name == "reduce_lr_on_plateau":
+            def _scheduler(optimizer):
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    mode="max",
+                    factor=sch_cfg["factor"],
+                    patience=sch_cfg["patience"],
+                    min_lr=sch_cfg["min_lr"],
+                    threshold=sch_cfg["threshold"],
+                )
+                return {"scheduler": scheduler, "monitor": sch_cfg["monitor"], "interval": "epoch"}
+            return _scheduler
+        if name == "cosine":
+            def _scheduler(optimizer):
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=sch_cfg["T_max"], eta_min=sch_cfg["eta_min"])
+                return {"scheduler": scheduler, "interval": "epoch"}
+            return _scheduler
+        if name == "cosine_with_warmup":
+            warmup_steps = sch_cfg.get("warmup_steps", 500)
+            max_steps = sch_cfg.get("max_steps", 10000)
+            def _scheduler(optimizer):
+                def lr_lambda(step):
+                    if step < warmup_steps:
+                        return float(step) / float(warmup_steps)
+                    progress = (step - warmup_steps) / float(max_steps - warmup_steps)
+                    return 0.5 * (1 + torch.cos(torch.pi * progress))
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+                return {"scheduler": scheduler, "interval": "step"}
+            return _scheduler
+        raise ValueError(f"Unknown scheduler: {sch_cfg['name']}")
+
+    # ---------------------
+    # Debug print helpers
+    # ---------------------
+    @staticmethod
+    def print_param_group_summary(param_groups, tag=""):
+        print("\n" + "-"*60)
+        print(f"[DEBUG] {tag}")
+        for i, g in enumerate(param_groups):
+            cnt = len(g.get("params", []))
+            lr = g.get("lr", None)
+            wd = g.get("weight_decay", None)
+            print(f"  ParamGroup {i}: count={cnt}  lr={lr}  wd={wd}")
+        print("-"*60 + "\n")
+
+        

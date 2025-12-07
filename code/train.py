@@ -10,11 +10,9 @@ import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 import torchmetrics
 from torchmetrics import MeanMetric
-import pytorch_msssim
-
 from loss import *
 from selector_helpers import *
-from torchmetrics.classification import MulticlassAUROC
+from torchmetrics.classification import MulticlassAUROC, MulticlassPrecision, MulticlassRecall, MulticlassF1Score, MulticlassConfusionMatrix
 VIZ_FREQUENCY = 10
 
 
@@ -24,12 +22,9 @@ class LightningSingleModel(pl.LightningModule):
         model,
         method,
         criterion_clf,
-        #criterion_recon,
         optimizer_fn,
         scheduler_fn=None,      
-        device=None,
         parameters_dict=None,
-        dataloaders=None,
         paths = None,
     ):
         super().__init__()
@@ -37,14 +32,12 @@ class LightningSingleModel(pl.LightningModule):
         self.model = model
         self.method = method
         self.criterion_clf = criterion_clf
-        #self.criterion_recon = criterion_recon
         self.optimizer_fn = optimizer_fn
         self.scheduler_fn = scheduler_fn
         self.parameters_dict = parameters_dict
-        self.dataloaders_ref = dataloaders   # only needed for viz
         self.paths = paths
 
-        # unpack model params
+        # unpack model params .get
         model_params = parameters_dict[f"{method}_model_parameters"]
         self.model_params = model_params
         self.recon_enabled = model_params["recon_enabled"]
@@ -55,12 +48,12 @@ class LightningSingleModel(pl.LightningModule):
         self.class_num = parameters_dict["class_num"]
 
         #regularization features
-        self.attn_reg_enabled = model_params.get("attn_reg_enabled", False)
-        self.lambda_attn_sparsity = model_params.get("lambda_attn_sparsity", 0.0)
-        self.lambda_attn_consistency = model_params.get("lambda_attn_consistency", 0.0)
+        self.attn_reg_enabled = model_params["attn_reg_enabled"]
+        self.lambda_attn_sparsity = model_params["lambda_attn_sparsity"]
+        self.lambda_attn_consistency = model_params["lambda_attn_consistency"]
 
-        self.feat_norm_reg_enabled = model_params.get("feat_norm_reg_enabled", False)
-        self.lambda_feat_norm = model_params.get("lambda_feat_norm", 0.0)
+        self.feat_norm_reg_enabled = model_params["feat_norm_reg_enabled"]
+        self.lambda_feat_norm = model_params["lambda_feat_norm"]
 
 
         #unfreeze      
@@ -90,15 +83,14 @@ class LightningSingleModel(pl.LightningModule):
         # debug
         self.debug_training = parameters_dict["debug_training"]
         self.debug_first =parameters_dict["full_debug"]
-
+        self.debug_anomaly =parameters_dict["debug_anomaly"]
+        torch.autograd.set_detect_anomaly(self.debug_anomaly) 
 
         
         # book keeping for some non standard metrics
         self.best_val_acc = -1.0 #used to only save on best val acc
         self.latest_val_sample = None
 
-        # used for visualization
-        self._prepare_viz_batch(dataloaders)
 
         #transform helpers for tta
         self.transforms_list = self.transforms_list = [ 
@@ -110,52 +102,47 @@ class LightningSingleModel(pl.LightningModule):
         #  [tta_id,inv_tta_id,tta_flip_lr,inv_tta_flip_lr,tta_flip_ud,inv_tta_flip_ud,tta_flip_lrud,inv_tta_flip_lrud]
 
         # metric objects (track averages across batches/epochs)
-        self.train_mask_dice = MeanMetric()
-        self.val_mask_dice = MeanMetric()
-        self.train_recon_loss = MeanMetric()
-        self.val_recon_loss = MeanMetric()
-        self.train_mimic_loss = MeanMetric()
-        self.val_mimic_loss = MeanMetric()
-        self.train_auc = MulticlassAUROC(num_classes=self.class_num)
-        self.val_auc = MulticlassAUROC(num_classes=self.class_num)
-        self.test_auc = MulticlassAUROC(num_classes=self.class_num)
-        self.val_roc_auc = MulticlassAUROC(num_classes=self.class_num)
+        # -------------------
+        # TRAIN METRICS
+        # -------------------
+        self.train_mask_loss   = MeanMetric()
+        self.train_recon_loss  = MeanMetric()
+        self.train_mimic_loss  = MeanMetric()
+        self.train_acc         = MeanMetric()
+        self.train_f1          = MulticlassF1Score(num_classes=self.class_num)
+        # -------------------
+        # VALIDATION METRICS
+        # -------------------
+        self.val_mask_loss     = MeanMetric()
+        self.val_recon_loss    = MeanMetric()
+        self.val_mimic_loss    = MeanMetric()
+
+        self.val_roc_auc       = MulticlassAUROC(num_classes=self.class_num)
+        self.val_f1            = MulticlassF1Score(num_classes=self.class_num)
+        self.val_precision     = MulticlassPrecision(num_classes=self.class_num)
+        self.val_recall        = MulticlassRecall(num_classes=self.class_num)
+        self.val_confmat       = MulticlassConfusionMatrix(num_classes=self.class_num)
+
+        # -------------------
+        # TEST METRICS
+        # -------------------
+        self.test_auc          = MulticlassAUROC(num_classes=self.class_num)
+        self.test_f1           = MulticlassF1Score(num_classes=self.class_num)
+        self.test_precision    = MulticlassPrecision(num_classes=self.class_num)
+        self.test_recall       = MulticlassRecall(num_classes=self.class_num)
+        self.test_confmat      = MulticlassConfusionMatrix(num_classes=self.class_num)
+        self.test_acc          = MeanMetric()
+
 
         self.opt_factory = LightningOptimizerFactory(
                 model=self.model,
                 parameters=parameters_dict,
                 model_type=method,
             )
-    # -------------------------
-    # prep viz batch
-    # ----------------
-    def _prepare_viz_batch(self, dataloaders):
-        self.viz_inputs_cpu = None
-        self.viz_masks_cpu = None
-        self.viz_labels_cpu = None
-        self.num_viz_samples = 0
-
-        if self.debug_training and "val" in dataloaders and len(dataloaders["val"]) > 0:
-            example = next(iter(dataloaders["val"]))
-            if len(example) == 3:
-                vi, vm, vl = example
-            else:
-                vi, vl = example
-                vm = None
-
-            if vi is not None:
-                N = min(4, vi.size(0))
-                self.num_viz_samples = N
-                self.viz_inputs_cpu = vi[:N].cpu()
-                if vm is not None:
-                    self.viz_masks_cpu = vm[:N].float().cpu()
-                self.viz_labels_cpu = vl[:N].cpu()
-    
+        self.to(self.device)
     #---
     # get optimizer
     #---
-
-
     def configure_optimizers(self):
       optimizer = self.optimizer_fn(self.model.parameters())
       if self.scheduler_fn is None:
@@ -177,21 +164,32 @@ class LightningSingleModel(pl.LightningModule):
               "optimizer": optimizer,
               "lr_scheduler": {
                   "scheduler": sched_ret,
-                  "monitor": self.parameters_dict.get("control_metric", None),
+                  "monitor": self.parameters_dict["control_metric"],
                   "interval": "epoch",
               },
               "grad_clip_val": self.parameters_dict[f'{self.method}_model_parameters']['grad_clip'],
               "gradient_clip_algorithm": self.parameters_dict[f'{self.method}_model_parameters']['gradient_clip_algorithm']
           }
-      #fallback
+      #fallback 
       print('no scheduler, returning optimizer in train')
       return optimizer
 
+    #debug    
+    def on_before_optimizer_step(self, optimizer):
+      if self.debug_anomaly and self.global_step % 100 == 0:   # print every 100 steps
+          for name, p in self.named_parameters():
+              if p.grad is not None:
+                  print(f"{name} grad norm: {p.grad.norm().item()}")
 
     # --- 
     # Gradual unfreezing
     # ---
     def on_train_epoch_start(self):
+        self.train_mask_loss.reset()
+        self.train_recon_loss.reset()
+        self.train_mimic_loss.reset()
+        self.train_acc.reset()
+        self.train_f1.reset()
 
         if self.backbone_freeze_on_start and self.current_epoch <= (self.unfreeze_timer*self.backbone_num_groups+1):         
           if self.current_epoch % self.unfreeze_timer == 0 and self.current_epoch != 0:
@@ -204,17 +202,28 @@ class LightningSingleModel(pl.LightningModule):
     def on_validation_epoch_start(self):
         # reset validation metrics to ensure per-epoch accumulation
         try:
-            self.val_auc.reset()
-        except Exception:
-            pass
-        try:
+            self.val_mask_loss.reset()
+            self.val_recon_loss.reset()
+            self.val_mimic_loss.reset()
+            self.val_precision.reset()
+            self.val_recall.reset()
+            self.val_confmat.reset()   
             self.val_roc_auc.reset()
+            self.val_f1.reset()
+            self.val_confmat.reset()
+
         except Exception:
             pass
 
     def on_test_epoch_start(self):
         try:
             self.test_auc.reset()
+            self.test_f1.reset()
+            self.test_precision.reset()
+            self.test_recall.reset()
+            self.test_confmat.reset()
+            self.test_acc.reset()
+        
         except Exception:
             pass
     # --------------------------------
@@ -227,7 +236,7 @@ class LightningSingleModel(pl.LightningModule):
     # --------------------------------
     # shared step (train + val)
     # --------------------------------
-
+    
     def _shared_step(self, batch, batch_idx, phase, return_preds: bool = False):
         is_train = phase == "train"
 
@@ -238,12 +247,6 @@ class LightningSingleModel(pl.LightningModule):
             inputs, labels = batch
             masks = None
 
-        # aux loss weight scheduling, drops off towards epoch
-        if self.parameters_dict.get('use_simple_aux_loss_scheduling', False):
-            aux_w = max(0.0, 1 - self.current_epoch / self.parameters_dict["aux_loss_weight_epoch_limit"])
-        else:
-            aux_w = 1.0
-
         inputs = inputs.to(self.device)
         labels = labels.to(self.device)
         if masks is not None:
@@ -253,10 +256,17 @@ class LightningSingleModel(pl.LightningModule):
         labels = labels.long()
 
         # DEBUG only first few
-        if self.current_epoch == 0 and batch_idx < 5 and self.debug_first and is_train:
+        if self.debug_first and self.current_epoch == 0 and batch_idx < 5 and is_train:
             print(f"[DEBUG] Input Stats: Min={inputs.min():.4f}, Max={inputs.max():.4f}, Mean={inputs.mean():.4f}, Std={inputs.std():.4f}")
             if masks is not None:
                 print(f"[DEBUG] Mask Stats: Min={masks.min():.4f}, Max={masks.max():.4f}, Mean={masks.mean():.4f}")
+
+        # aux loss weight scheduling, drops off towards epoch
+        if self.parameters_dict['use_simple_aux_loss_scheduling']:
+            aux_w = max(0.0, 1 - self.current_epoch / self.parameters_dict["aux_loss_weight_epoch_limit"])
+        else:
+            aux_w = 1.0
+
 
         # If caller asked for predictions (validation), run forward under no_grad to be explicit/safe
         # forward step
@@ -268,6 +278,10 @@ class LightningSingleModel(pl.LightningModule):
         recon_feats = aux.get("recon_feats", []) if aux is not None else []
         proj_pairs = aux.get("proj_pairs", None) if aux is not None else None
 
+        #----
+        # Classification
+        #----
+
         # classification loss (label smoothing only during training)
         if self.label_smoother is not None and is_train:
             smoothed = self.label_smoother(outputs, labels)
@@ -275,6 +289,7 @@ class LightningSingleModel(pl.LightningModule):
         else:
             # during validation we compute plain classification loss for logging (no gradient if no_grad)
             clf_loss = self.criterion_clf(outputs, labels)
+        
 
         batch_loss = clf_loss
         # ---------------------------------------
@@ -287,47 +302,18 @@ class LightningSingleModel(pl.LightningModule):
 
         raw_feats = aux.get("raw_feats", None)
 
-        # ----- ATTENTION SPARSITY -----
-        if self.attn_reg_enabled and self.lambda_attn_sparsity > 0:
-            attn_map = aux.get("mask_attn_map", None)
-
-            if attn_map is not None:
-                # L1 sparsity on attention map
-                attn_sparsity_loss = attn_map.abs().mean()
-            else:
-                attn_sparsity_loss = torch.tensor(0.0, device=self.device)
-
-            batch_loss += self.lambda_attn_sparsity * attn_sparsity_loss
-
-        # ----- ATTENTION CONSISTENCY -----
-        if self.attn_reg_enabled and self.lambda_attn_consistency > 0:
-            # Use projected features (dimension = proj_dim)
-            p1, p1_r, p2, p2_r = aux["proj_pairs"]
-
-            # Upsample p2 to match p1 spatial size
-            p2_up = F.interpolate(p2, size=p1.shape[-2:], mode="bilinear", align_corners=False)
-
-            # Normalize both
-            p1_norm = p1 / (p1.norm(dim=1, keepdim=True) + 1e-6)
-            p2_norm = p2_up / (p2_up.norm(dim=1, keepdim=True) + 1e-6)
-
-            # Consistency loss
-            attn_consistency_loss = torch.tensor(0.0, device=self.device)
-
-            attn_consistency_loss = F.mse_loss(p1_norm, p2_norm)
-
-            batch_loss += self.lambda_attn_consistency * attn_consistency_loss
-
-        # ----- FEATURE NORM REGULARIZATION -----
-        if self.feat_norm_reg_enabled and self.lambda_feat_norm > 0 and raw_feats is not None:
-            feat_norm_loss = sum([f.pow(2).mean() for f in raw_feats])
-            batch_loss+=self.lambda_feat_norm * feat_norm_loss
-
-        
+        # ---- REGULARIZATION ----
+        if self.attn_reg_enabled:
+            attn_sparsity_loss = compute_attn_sparsity_loss(aux, self.lambda_attn_sparsity, self.device)
+            attn_consistency_loss = compute_attn_consistency_loss(aux, self.lambda_attn_consistency, self.device)
+            batch_loss+= attn_sparsity_loss * self.lambda_attn_sparsity + attn_consistency_loss* self.lambda_attn_consistency
+        if self.feat_norm_reg_enabled:
+            feat_norm_loss = compute_feat_norm_loss(aux, self.lambda_feat_norm, self.device)
+            batch_loss+= feat_norm_loss * self.lambda_feat_norm
 
 
         # ----------------------
-        # mask losses
+        # Mask loss
         # ----------------
         mask_out_resized = None
         if self.mask_enabled and mask_output is not None and masks is not None:
@@ -339,128 +325,134 @@ class LightningSingleModel(pl.LightningModule):
                                                  align_corners=False)
             else:
                 mask_out_resized = mask_output
+            #only dice supported for now
+            # convert to one hot
+            mask_probs = torch.sigmoid(mask_output)       # probabilities
+            mask_pred_onehot = torch.cat([1 - mask_probs, mask_probs], dim=1)  # (N, 2, H, W)
+            mask_target_onehot = torch.cat([1 - masks, masks], dim=1)
+            mask_loss = 1.0 - self.mask_criterion(mask_pred_onehot, mask_target_onehot)
 
-            mask_loss = self.mask_criterion(mask_out_resized, masks)
-            # Add mask loss to optimization loss *only during training*
+
             if is_train:
-                batch_loss = batch_loss + self.lambda_mask * mask_loss
-
-            # dice metric (update irrespective of phase)
-            with torch.no_grad():
-                pred_bin = (torch.sigmoid(mask_out_resized) > 0.5).float()
-                gt_bin = (masks > 0.5).float()
-                inter = (pred_bin * gt_bin).sum(dim=(1, 2, 3))
-                union = pred_bin.sum(dim=(1, 2, 3)) + gt_bin.sum(dim=(1, 2, 3))
-                dice = ((2 * inter + 1e-6) / (union + 1e-6))  # per-sample dice
-
-                if is_train:
-                    self.train_mask_dice.update(dice.mean())
-                else:
-                    self.val_mask_dice.update(dice.mean())
+                batch_loss += self.lambda_mask * mask_loss
+                self.train_mask_loss.update(mask_loss)
+            else:
+                self.val_mask_loss.update(mask_loss)
+                    
 
         # ----------------
         # recon + mimic
         # -----------------
         recon_loss_val = torch.tensor(0.0, device=self.device)
         mimic_loss_val = torch.tensor(0.0, device=self.device)
-
+        # ---- Auxiliary losses ----
         if self.recon_enabled and aux_w > 0.0:
-
-            # ---------
-            # Reconstruction
-            # ---------
-            for idx_r, pred_r in enumerate(recon_feats):
-                if pred_r is None:
-                    continue
-                
-                # --- Choose target WITHOUT scaling ---
-                if idx_r == 0:
-                    target = inputs
-                else:
-                    # Instead of scale_factor, directly use pred_r size
-                    target = F.interpolate(
-                        inputs, 
-                        size=pred_r.shape[-2:], 
-                        mode="bilinear", 
-                        align_corners=False
-                    )
-
-                # --- Channel match (grayscale case) ---
-                if pred_r.size(1) == 1 and target.size(1) > 1:
-                    target = target.mean(dim=1, keepdim=True)
-
-                # --- Ensure sizes match (failsafe only) ---
-                if pred_r.shape[-2:] != target.shape[-2:]:
-                    pred_r = F.interpolate(
-                        pred_r,
-                        size=target.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False
-                    )
-
-                recon_loss_val += recon_image_loss(pred_r, target)
+          recon_loss_val, mimic_loss_val = self.compute_aux_losses(aux, inputs, aux.get("proj_pairs", None), aux_w, is_train)
+          # Update metrics
+          if is_train:
+              self.train_recon_loss.update(recon_loss_val.detach())
+              self.train_mimic_loss.update(mimic_loss_val.detach())
+              batch_loss += (
+                  self.lambda_recon * recon_loss_val * aux_w +
+                  self.lambda_mimic * mimic_loss_val * aux_w
+              )
+          else:
+              self.val_recon_loss.update(recon_loss_val.detach())
+              self.val_mimic_loss.update(mimic_loss_val.detach())
+              
 
 
-            # ---------
-            # Mimic Loss
-            # ---------
-            if self.mimic_enabled and proj_pairs is not None and len(proj_pairs) >= 4:
-                p1, p1_r, p2, p2_r = proj_pairs[:4]
-                mimic_loss_val = (
-                    mimic_feat_loss(p1, p1_r) +
-                    mimic_feat_loss(p2, p2_r)
-                )
+        # -------------------
+        # Compute batch accuracy safely
+        # -------------------
 
+        preds = outputs.argmax(dim=1)
+        batch_acc = (preds == labels).float().mean()
+        # -------------------
+        # Update metrics
+        # -------------------
+        self.update_metrics(preds, outputs, labels, phase=phase)
 
-            # ---------
-            # Add auxiliary losses (training only)
-            # ---------
-            if is_train:
-                batch_loss += (
-                    self.lambda_recon * recon_loss_val * aux_w +
-                    self.lambda_mimic * mimic_loss_val * aux_w
-                )
-
-
-        # ---------
-        # Metrics Logging
-        # ---------
+        # -------------------
+        # Log aggregated metrics (MeanMetric objects)
+        # -------------------
         if is_train:
-            self.train_recon_loss.update(recon_loss_val.detach())
-            self.train_mimic_loss.update(mimic_loss_val.detach())
+            self.log(f"train_loss", batch_loss, prog_bar=True, on_step=False, on_epoch=True)
+            self.log(f"train_acc", batch_acc, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("train_mask_loss", self.train_mask_loss.compute(),  on_step=False, on_epoch=True, prog_bar=True)
+            self.log("train_recon_loss", self.train_recon_loss,  on_step=False, on_epoch=True, prog_bar=True)
+            self.log("train_mimic_loss", self.train_mimic_loss,  on_step=False, on_epoch=True, prog_bar=True)
         else:
-            self.val_recon_loss.update(recon_loss_val.detach())
-            self.val_mimic_loss.update(mimic_loss_val.detach())
+            self.log(f"val_loss", batch_loss, prog_bar=True, on_step=False, on_epoch=True)
+            self.log(f"val_acc", batch_acc, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("val_mask_loss", self.val_mask_loss.compute(), on_step=False, on_epoch=True, prog_bar=True)
+            self.log("val_recon_loss", self.val_recon_loss, on_step=False, on_epoch=True, prog_bar=True)
+            self.log("val_mimic_loss", self.val_mimic_loss, on_step=False, on_epoch=True, prog_bar=True)
 
-        # ------------------
-        # metrics (accuracy counted without grads)
-        # ---------------------
-        with torch.no_grad():
-            _, preds = outputs.max(dim=1)
-            correct = (preds == labels).sum().item()
-            batch_size = labels.size(0)
-
-        # log (Lightning)
-        self.log(f"{phase}_loss", batch_loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log(f"{phase}_acc", correct / batch_size, prog_bar=True, on_step=False, on_epoch=True)
-
-        # log metric objects (will be aggregated/reset by Lightning)
-        if is_train:
-            self.log("train_mask_dice", self.train_mask_dice, on_epoch=True, prog_bar=True)
-            self.log("train_recon_loss", self.train_recon_loss, on_epoch=True, prog_bar=True)
-            self.log("train_mimic_loss", self.train_mimic_loss, on_epoch=True, prog_bar=True)
-        else:
-            self.log("val_mask_dice", self.val_mask_dice, on_epoch=True, prog_bar=True)
-            self.log("val_recon_loss", self.val_recon_loss, on_epoch=True, prog_bar=True)
-            self.log("val_mimic_loss", self.val_mimic_loss, on_epoch=True, prog_bar=True)
-
+        # -------------------
+        # Optional: return detached outputs
+        # -------------------
         if return_preds:
-            # detach outputs so caller doesn't accidentally keep computation graph
-            return batch_loss.detach(), outputs.detach(), aux, mask_out_resized  
+            return batch_loss.detach(), outputs.detach(), aux, mask_out_resized
+
         return batch_loss
+        
+    #---
+    # Compuite aux lossees
+    #--
+
+    def compute_aux_losses(self, aux, inputs, proj_pairs, aux_w, is_train):
+        """Compute reconstruction and mimic losses with optional weighting."""
+        recon_feats = aux.get("recon_feats", []) if aux is not None else []
+        proj_pairs = aux.get("proj_pairs", None) if aux is not None else None
+
+        recon_loss_val = torch.tensor(0.0, device=self.device)
+        mimic_loss_val = torch.tensor(0.0, device=self.device)
+
+        if aux_w <= 0.0:
+            return recon_loss_val, mimic_loss_val
+
+        # ---- Reconstruction Loss ----
+        for pred_r in recon_feats:
+            if pred_r is None:
+                continue
+            target = inputs
+            pred_r_upsampled = F.interpolate(pred_r, size=target.shape[-2:], mode="bilinear", align_corners=False)
+            if pred_r_upsampled.size(1) == 1 and target.size(1) > 1:
+                target = target.mean(dim=1, keepdim=True)
+
+            recon_loss_val += recon_image_loss(pred_r_upsampled, target)
+
+        # ---- Mimic Loss ----
+        if self.mimic_enabled and proj_pairs is not None and len(proj_pairs) >= 4:
+            p1, p1_r, p2, p2_r = proj_pairs[:4]
+            mimic_loss_val = mimic_feat_loss(p1, p1_r) + mimic_feat_loss(p2, p2_r)
+
+        # ---- Weight by aux_w (training only) ----
+        if is_train:
+            recon_loss_val = recon_loss_val * self.lambda_recon * aux_w
+            mimic_loss_val = mimic_loss_val * self.lambda_mimic * aux_w
+
+        return recon_loss_val, mimic_loss_val
+    #---
+    # Compute reg lossees
+    #--
+
+    def compute_regularization_losses(self, aux):
+        """Compute attention sparsity, attention consistency, and feature norm regularization."""
+        attn_sparsity_loss = torch.tensor(0.0, device=self.device)
+        attn_consistency_loss = torch.tensor(0.0, device=self.device)
+        feat_norm_loss = torch.tensor(0.0, device=self.device)
 
 
+        if self.attn_reg_enabled:
+            attn_sparsity_loss = compute_attn_sparsity_loss(aux, self.lambda_attn_sparsity, self.device)
+            attn_consistency_loss = compute_attn_consistency_loss(aux, self.lambda_attn_consistency, self.device)
 
+        if self.feat_norm_reg_enabled:
+            feat_norm_loss = compute_feat_norm_loss(aux, self.lambda_feat_norm, self.device)
+
+        return attn_sparsity_loss, attn_consistency_loss, feat_norm_loss
 
 
     # ----
@@ -600,16 +592,12 @@ class LightningSingleModel(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):      
         loss, outputs, aux, mask_output = self._shared_step(batch, batch_idx, "val", return_preds=True)
-     
-        probs = torch.softmax(outputs, dim=-1)
-        labels = batch[-1].long()
-        self.val_roc_auc.update(probs, labels)
         
         if self.parameters_dict['debug_val'] and (self.enable_modality_attention or self.mask_enabled) and batch_idx == 0: 
           # Only store FIRST batch of validation
           self.latest_val_sample = {
               "input": batch[0][0].detach().cpu(),
-              "pred_mask": mask_output[0].detach().cpu(),
+              "pred_mask": mask_output.detach().cpu() if self.mask_enabled else None,
               "gt_mask": batch[1][0].detach().cpu() if self.mask_enabled else None,
               "mod_attn": aux["mod_attn_map"].detach().cpu() if self.enable_modality_attention else None,
           }
@@ -622,8 +610,8 @@ class LightningSingleModel(pl.LightningModule):
         val_acc = float(self.trainer.callback_metrics["val_acc"])
 
         #compute & update  & reset val_auc_roc
-        val_auc_roc = self.val_roc_auc.compute()
-        self.log("val_roc_auc", val_auc_roc, prog_bar=True)
+        val_roc_auc = self.val_roc_auc.compute()
+        self.log("val_roc_auc", val_roc_auc, prog_bar=True)
         self.val_roc_auc.reset()
         
         # nothing to compare yet
@@ -647,7 +635,7 @@ class LightningSingleModel(pl.LightningModule):
                     torch.save(best["gt_mask"], f"{save_dir}/best_gt_mask.pt")
 
                 # Optional visualization
-                if self.parameters_dict.get("debug_val", False):
+                if self.parameters_dict["debug_val"]:
                     visualize_single_mask_triplet(
                         input_img=best["input"],
                         gt_mask=best["gt_mask"],
@@ -667,38 +655,50 @@ class LightningSingleModel(pl.LightningModule):
                 if mod is not None:
                     torch.save(vec, f"{save_dir}/best_modality_attention.pt")
 
+
                 if self.parameters_dict.get("debug_val", False):
-                    self.print(f"Modality vector (sample 0): {vec}")
+                    vec = mod_cpu.mean(dim=0).view(-1).tolist()
+                    self.print(f"Modality vector (batch mean): {vec}")
+                    #self.print(f"Modality vector (sample 0): {vec}")
     # -----
     #  lightning test step
     # ---------
 
     def test_step(self, batch, batch_idx):
-
         mode = self.parameters_dict["test_mode"]
         mc_passes = self.parameters_dict["mc_passes"]
 
-        # handle predictions
+        # ---- prediction ----
         pred_result = self.predict_custom(batch, mode=mode, mc_passes=mc_passes)
-        # handle normal / tta result
         if isinstance(pred_result, torch.Tensor):
             outputs = pred_result
-        # handle MC or TTA_MC which return (mean, var)
+            variance = None
         elif isinstance(pred_result, tuple):
             outputs, variance = pred_result
-            self.log("test_uncertainty", variance.mean().item(), prog_bar=False)
+            # log MC/TTA uncertainty
+            self.log("test_uncertainty_mean", variance.mean(), prog_bar=False)
         else:
             raise RuntimeError("Unexpected predict_custom output.")
 
-        # compute accuracy
-        labels = batch[-1]
+        labels = batch[-1].long()
         preds = outputs.argmax(dim=1)
-        acc = (preds == labels).float().mean()
 
-        self.log("test_acc", acc, prog_bar=True) # todo add more test data
+        # ---- update test metrics ----
+        self.test_acc.update((preds == labels).float().mean())
+        self.test_auc.update(outputs, labels)
+        self.test_f1.update(outputs, labels)
+        self.test_precision.update(outputs, labels)
+        self.test_recall.update(outputs, labels)
+        self.test_confmat.update(preds, labels)
 
-        return acc
+        # ---- log aggregated metrics ----
+        self.log("test_acc", self.test_acc, prog_bar=True, on_epoch=True)
+        self.log("test_auc", self.test_auc, prog_bar=True, on_epoch=True)
+        self.log("test_f1", self.test_f1, prog_bar=True, on_epoch=True)
+        self.log("test_precision", self.test_precision, prog_bar=True, on_epoch=True)
+        self.log("test_recall", self.test_recall, prog_bar=True, on_epoch=True)
 
+        return preds
 
     #update to train previously frozen
     def _sync_optimizer_new_params(self):
@@ -716,8 +716,8 @@ class LightningSingleModel(pl.LightningModule):
         if not to_add:
             return
 
-        base_lr = self.parameters_dict.get("backbone_unfreeze_lr", 1e-4)
-        factor = self.parameters_dict.get("backbone_unfreeze_lr_factor", 0.25)
+        base_lr = self.parameters_dict["backbone_unfreeze_lr"]
+        factor = self.parameters_dict["backbone_unfreeze_lr_factor"]
 
         # clean, safe LR schedule
         backbone_lr = base_lr * (factor ** self.layers_unfrozen)
@@ -738,6 +738,38 @@ class LightningSingleModel(pl.LightningModule):
         )
         self.log("grad_norm", total_norm, prog_bar=True)
 
+    # -------------------
+    # Helper: Update metrics
+    # -------------------
+
+
+    @torch._dynamo.disable
+    def update_metrics(self, preds, logits, labels, phase="train"):
+        """
+        Update all metrics for a given phase.
+        Args:
+            preds:  model predictions
+            labels: ground truth class indices (same spatial shape as logits)
+            phase: "train" | "val" | "test"
+        """
+        labels = labels.long()
+        
+        if phase == "train":
+            self.train_f1.update(preds, labels)
+        elif phase == "val":
+                  
+            # Compute softmax probabilities for AUROC
+            probs = torch.softmax(logits, dim=1)  # shape (B, C, H, W) or (B, C, D, H, W)
+            self.val_f1.update(preds, labels)
+            self.val_roc_auc.update(probs, labels)
+            self.val_confmat.update(preds, labels)
+        elif phase == "test":                  
+            # Compute softmax probabilities for AUROC
+            probs = torch.softmax(logits, dim=1)  # shape (B, C, H, W) or (B, C, D, H, W)
+            self.test_f1.update(preds, labels)
+            self.test_auc.update(probs, labels)
+        else:
+            raise ValueError(f"Unknown phase {phase}")
 
 
 # -------
@@ -774,6 +806,17 @@ class GetWeights:
 
 #simple vizualizer with less perf impact
 def visualize_single_mask_triplet(input_img, gt_mask, pred_mask, title_prefix=""):
+
+    # --- FIX: reduce 3D masks to 2D for visualization ---
+    if pred_mask.ndim == 3:  # (1, H, W)
+        pred_mask = pred_mask.squeeze(0)
+
+    elif pred_mask.ndim == 4:  # (H, W, D)
+        pred_mask = pred_mask[pred_mask.shape[-1] // 2]  # center slice
+
+    elif pred_mask.ndim == 5:  # (1, H, W, D)
+        pred_mask = pred_mask.squeeze(0)[pred_mask.shape[-1] // 2]
+
     input_img = input_img[0]
     gt_mask = gt_mask.squeeze()
     pred_bin = (torch.sigmoid(pred_mask) > 0.5).squeeze().float().cpu().numpy() # same as used in mask loss calculation, important
@@ -799,7 +842,7 @@ def visualize_single_mask_triplet(input_img, gt_mask, pred_mask, title_prefix=""
 
 
     plt.subplot(1, 4, 4)
-    plt.imshow(pred_bin, cmap="gray")
+    plt.imshow(pred_bin, cmap="Grays_r") #invert color scale 
     plt.title("Pred Bin")
     plt.axis("off")
 
@@ -807,24 +850,59 @@ def visualize_single_mask_triplet(input_img, gt_mask, pred_mask, title_prefix=""
     plt.show()
     plt.close("all")
 
+def compute_attn_sparsity_loss(aux, lambda_attn_sparsity, device):
+    """
+    L1 sparsity on attention maps
+    """
+    attn_map = aux.get("mask_attn_map", None)
+    if attn_map is not None:
+        loss = attn_map.abs().mean() * lambda_attn_sparsity
+    else:
+        loss = torch.tensor(0.0, device=device)
+    return loss
+def compute_attn_consistency_loss(aux, lambda_attn_consistency, device):
+    """
+    Consistency loss between projected features from multiple views
+    """
+    if "proj_pairs" not in aux or aux["proj_pairs"] is None:
+        return torch.tensor(0.0, device=device)
+
+    p1, p1_r, p2, p2_r = aux["proj_pairs"]
+
+    # Upsample p2 to match p1
+    p2_up = F.interpolate(p2, size=p1.shape[-2:], mode="bilinear", align_corners=False)
+
+    # Normalize features
+    p1_norm = p1 / (p1.norm(dim=1, keepdim=True) + 1e-6)
+    p2_norm = p2_up / (p2_up.norm(dim=1, keepdim=True) + 1e-6)
+
+    loss = F.mse_loss(p1_norm, p2_norm) * lambda_attn_consistency
+    return loss
+
+    
+def compute_feat_norm_loss(aux, lambda_feat_norm, device):
+    """
+    L2 norm of intermediate features for regularization
+    """
+    raw_feats = aux.get("raw_feats", None)
+    if raw_feats is not None and lambda_feat_norm > 0:
+        loss = sum([f.pow(2).mean() for f in raw_feats]) * lambda_feat_norm
+    else:
+        loss = torch.tensor(0.0, device=device)
+    return loss
+
 
 def mimic_feat_loss(s_feat: torch.Tensor, t_feat: torch.Tensor) -> torch.Tensor:
     s = F.normalize(s_feat.flatten(1), dim=1)
     t = F.normalize(t_feat.flatten(1), dim=1)
     return 1.0 - (s * t).sum(dim=1).mean()
 
-
-def recon_image_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+#charbonnier recon loss
+def charbonnier_loss(pred, target, eps=1e-3):
+    return torch.mean(torch.sqrt((pred - target)**2 + eps**2))
+def recon_image_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     pred = torch.sigmoid(pred)
-    # per-image normalization (safe)
-    t = target.view(target.size(0), -1)
-    t_min = t.min(dim=1)[0].view(-1, 1, 1, 1)
-    t_max = t.max(dim=1)[0].view(-1, 1, 1, 1)
-    target = (target - t_min) / (t_max - t_min + eps)
-    pred = pred.clamp(0.0, 1.0)
-    target = target.clamp(0.0, 1.0)
-
-    l1 = F.l1_loss(pred, target)
-    ssim_l = 1.0 - pytorch_msssim.ssim(pred, target, data_range=1.0, size_average=True)
-   
-    return 0.5 * l1 + 0.5 * ssim_l
+    pred = pred.clamp(0,1)
+    target = target.clamp(0,1)
+    loss = charbonnier_loss(pred, target)
+    return loss

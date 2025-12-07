@@ -1,11 +1,11 @@
 import os
 import torch
+import copy
 import torch.nn as nn  
 from torch.utils.data import dataloader
 import torch.optim as optim 
 from loss import *
 from selector_helpers import *
-from model_test import *
 from train import *
 from train_fusion import *
 from debug_suite import *
@@ -16,7 +16,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Ea
 from pytorch_lightning.loggers import TensorBoardLogger
 
 # Run single model, save the result
-def run_single_model(fold, parameters, device, local_model, dataloaders_dict, method, train_labels, name, version):
+def run_single_model(fold, parameters, device, local_model, dataloaders_dict, method, train_labels, name, version, skip_testing = False):
 
     # ----
     # Get classifcation loss method
@@ -68,11 +68,10 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, me
         criterion_clf=classification_loss_method,
         optimizer_fn=optimizer_fn,
         scheduler_fn=scheduler_fn,   
-        device=device,
         parameters_dict=parameters,
-        dataloaders=dataloaders_dict,
         paths = paths
     )
+
     #--- run debug
     if parameters['debug_training']:
     
@@ -86,6 +85,9 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, me
       del model_copy
       torch.cuda.empty_cache()
 
+    # --- compile model
+    if parameters['compile']:
+       lightning_model = torch.compile(lightning_model, backend='inductor')
     # ---- CHECKPOINT ----
     checkpoint_cb = ModelCheckpoint(
         dirpath=paths["checkpoints"],
@@ -121,22 +123,25 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, me
         method=method,
         criterion_clf=classification_loss_method,
         optimizer_fn=optimizer_fn,
-        device=device,
         parameters_dict=parameters,
-        dataloaders=dataloaders_dict,
         paths = paths,
     )    
 
     # ----
     # Test the model
     # ----
+    skip_testing
     best_model.eval()
     best_model.to(device)
-    test_results = trainer.test(model=best_model, dataloaders=dataloaders_dict["test"])
-    # Save the metrics
-    save_metrics(test_results, paths["metrics_json"])
-
-
+    
+    #skip_testing only used for debug
+    if skip_testing:
+      test_results = None
+    else:
+      test_results = trainer.test(model=best_model, dataloaders=dataloaders_dict["test"])
+      # Save the metrics
+      save_metrics(test_results, paths["metrics_json"])
+      
     return {
     "best_checkpoint": checkpoint_cb.best_model_path,
     "trained_model": best_model.cpu(),    # CPU to reduce GPU memory
@@ -144,93 +149,124 @@ def run_single_model(fold, parameters, device, local_model, dataloaders_dict, me
     "test_metrics": test_results,   # from trainer.test()
   }
  
-
-
-def run_fusion_model(dwi_model, dce_model, fusion_model, dataloaders, parameters, device, fold, train_labels, method = "fusion"):
-
-    # Get classifcation loss method
-    # ----
+def run_fusion_model(dwi_model, dce_model, fusion_model, dataloaders_dict, parameters, device, fold, train_labels, name="fusion", version=None):
+    method = "fusion"
+    # ---- Losses ----
     classification_loss_method = get_classification_loss(parameters, train_labels, method, device)
-
-    # ---- 
-
-    # Selectors for reconstruction loss
-    # ----
     reconstruction_loss_method = get_recon_loss(parameters, method)
 
-    # ----
-    # Select optimizer
-    # ----    
-    
-    optimizer =  get_optimizer(fusion_model, parameters, method)
+    # ---- Paths ----
+    paths = prepare_output_paths(method, fold, parameters)
 
-    # ---
-    # train phase
-    # ---
-  
-    
-    dwi_model, dce_model, fusion_model, history = train_fusion_model(
-        dwi_model,
-        dce_model,
-        fusion_model,
-        dataloaders,
-        optimizer,
-        classification_loss_method,
-        device,
-        parameters,
-        finetune = False
+    # ---- Logger & Callbacks ----
+    lr_monitor = LearningRateMonitor(logging_interval="epoch")
+    logger = TensorBoardLogger(save_dir=paths["logs"], name=name, version=version)
+
+    early_params = parameters['early_stopping_parameters']
+    early_stop_cb = EarlyStopping(
+        monitor=early_params['metric'],
+        mode=early_params['mode'],
+        patience=early_params['patience'],
+        min_delta=early_params['min_delta'],
+        verbose=True
     )
-    # -------------
-    # Save updated weights
-    # -------------
-    model_dict_path = parameters['model_dict_path']
 
-    model_dict=torch.load(model_dict_path)
-    model_dict[f'fusion_{fold}']=fusion_model.state_dict()
-    torch.save(model_dict,model_dict_path)
+    checkpoint_cb = ModelCheckpoint(
+        dirpath=paths["checkpoints"],
+        monitor="val_acc",
+        mode="max",
+        save_top_k=1,
+        filename="best",
+    )
 
-    # -- 
-    # finetune, if applicable
-    # --
+    # ---- Optimizer & Scheduler ----
+    # Use unified factory for fusion
+    fusion_opt_factory = LightningFusionOptimizerFactory(
+        dwi_model= dwi_model,
+        dce_model= dce_model,
+        fusion_model= fusion_model,
+        parameters=parameters
+    )
+    optimizer_fn = fusion_opt_factory.optimizer_fn
+    scheduler_fn = fusion_opt_factory.scheduler_fn
 
-
-    if parameters["fusion_model_parameters"]["finetune"]: 
-      dwi_model, dce_model, fusion_model, history = train_fusion_model(
-          dwi_model,
-          dce_model,
-          fusion_model,
-          dataloaders,
-          optimizer,
-          classification_loss_method,
-          device,
-          parameters,
-          finetune = True,
-        )
-
-    # --------------
-    # Testing
-    # ------
-    fusion_model_test(
+    # ---- Build Lightning Model ----
+    lightning_model = LightningFusionModel(
         dwi_model=dwi_model,
         dce_model=dce_model,
         fusion_model=fusion_model,
-        dataloaders=dataloaders,
-        device=device,
-        mask_fusion=False  # we never have masks for testing
+        parameters_dict=parameters,
+        criterion_clf=classification_loss_method,
+        optimizer_fn=optimizer_fn,
+        scheduler_fn=scheduler_fn,
+        paths=paths
     )
-    # -------------
-    # Save final weights
-    # ------------
-    model_dict[f'final_fusion_{fold}'] = dwi_model.state_dict()
-    model_dict[f'final_dce_{fold}'] = dce_model.state_dict()
-    model_dict[f'final_fusion_{fold}'] = fusion_model.state_dict()
 
+    # ---- Optional debug run ----
+    if parameters['debug_training']:
+        model_cpu = copy.deepcopy(lightning_model).to(device)
+        run_debug_suite_fusion(model_cpu, method, parameters, device)
+        del model_cpu
+        torch.cuda.empty_cache()
+
+    # ---- Compile ----
+    if parameters.get('compile', False):
+        lightning_model = torch.compile(lightning_model, backend='inductor')
+
+    # ---- Trainer ----
+    trainer = pl.Trainer(
+        callbacks=[checkpoint_cb, lr_monitor, early_stop_cb],
+        logger=logger,
+        max_epochs=parameters["num_epochs"],
+        min_epochs=parameters["min_epochs"],
+        precision=parameters['precision'],
+    )
+
+    # ---- Fit ----
+    trainer.fit(
+        lightning_model,
+        dataloaders_dict["train"],
+        dataloaders_dict["val"]
+    )
+
+    # ---- Load best checkpoint ----
+    best_model = LightningFusionModel.load_from_checkpoint(
+        checkpoint_cb.best_model_path,
+        dwi_model=dwi_model,
+        dce_model=dce_model,
+        fusion_model=fusion_model,
+        parameters_dict=parameters,
+        criterion_clf=classification_loss_method,
+        optimizer_fn=optimizer_fn,
+        paths=paths
+    )
+
+    best_model.eval()
+    best_model.to(device)
+
+    # ---- Test ----
+    test_results = trainer.test(model=best_model, dataloaders=dataloaders_dict["test"])
+
+    save_metrics(test_results, paths["metrics_json"])
+
+    # ---- Save model state dict ----
+    model_dict_path = parameters.get('model_dict_path', f"{paths['root']}/fusion_model_dict.pth")
+    if os.path.exists(model_dict_path):
+        model_dict = torch.load(model_dict_path)
+    else:
+        model_dict = {}
+
+    model_dict[f'fusion_{fold}'] = fusion_model.state_dict()
+    model_dict[f'dwi_{fold}'] = dwi_model.state_dict()
+    model_dict[f'dce_{fold}'] = dce_model.state_dict()
     torch.save(model_dict, model_dict_path)
 
-    #unsure if used
-    return dwi_model, dce_model, fusion_model
-
-
+    return {
+        "best_checkpoint": checkpoint_cb.best_model_path,
+        "trained_model": best_model.cpu(),  # CPU to reduce GPU memory
+        "train_metrics": trainer.callback_metrics,
+        "test_metrics": test_results,
+    }
 
 #---
 #save helpers
