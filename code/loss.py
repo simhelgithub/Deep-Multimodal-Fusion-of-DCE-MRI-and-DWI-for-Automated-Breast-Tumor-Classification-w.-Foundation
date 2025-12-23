@@ -8,32 +8,60 @@ def proj_cosine_loss(a, b, eps=1e-8):
     cos_sim = F.cosine_similarity(a, b, dim=1, eps=eps)
     return (1.0 - cos_sim).mean()
 
-def dice_bce_loss(pred_logits, target, bce_weight=1.0, dice_weight=1.0):
-    bce = F.binary_cross_entropy_with_logits(pred_logits, target)
-    dice = DiceLoss()(pred_logits, target)
-    return bce_weight * bce + dice_weight * dice
+class DiceBCELoss(nn.Module):
+    """
+    Foreground-only Dice + BCE loss, 2D/3D compatible.
+    Input:
+        pred_logits: (B, 1, H, W) or (B, 1, D, H, W) raw logits
+        target: (B, 1, H, W) or (B, 1, D, H, W) binary mask (0/1)
+    """
+    def __init__(self, bce_weight=1.0, dice_weight=1.0, eps=1e-6):
+        super().__init__()
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+        self.eps = eps
 
-'''
- swapped for library function
-class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-6):
-        super(DiceLoss, self).__init__()
-        self.smooth = smooth
+    def forward(self, pred_logits, target):
+        # BCE loss
+        bce = F.binary_cross_entropy_with_logits(pred_logits, target)
 
-    def forward(self, inputs, targets):
-        # Apply sigmoid to inputs to transform logits to probabilities [0, 1]
-        inputs = torch.sigmoid(inputs)
-        
-        # Flatten spatial dimensions
-        inputs = inputs.view(-1)
-        targets = targets.view(-1)
-        #print(inputs.shape, targets.shape) #torch.Size([8192]) torch.Size([8192])
+        # Sigmoid to get probabilities
+        pred_probs = torch.sigmoid(pred_logits)
 
-        intersection = (inputs * targets).sum()
-        dice = (2. * intersection + self.smooth) / (inputs.sum() + targets.sum() + self.smooth)
+        # Flatten batch + spatial dims
+        pred_flat = pred_probs.view(pred_probs.size(0), -1)
+        target_flat = target.view(target.size(0), -1)
 
-        return 1 - dice
-'''
+        # Foreground Dice
+        intersection = (pred_flat * target_flat).sum(dim=1)
+        denom = pred_flat.sum(dim=1) + target_flat.sum(dim=1) + self.eps
+        dice_score = (2.0 * intersection) / denom
+        dice_loss = 1.0 - dice_score.mean()
+
+        # Combine BCE + Dice
+        loss = self.bce_weight * bce + self.dice_weight * dice_loss
+        return loss
+
+class SoftDiceLoss(nn.Module):
+    def __init__(self, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, logits, targets):
+        """
+        logits: (B, 1, H, W) or (B, 1, D, H, W)
+        targets: same shape, {0,1}
+        """
+        probs = torch.sigmoid(logits)
+
+        dims = tuple(range(2, probs.ndim))  # spatial dims
+        intersection = (probs * targets).sum(dims)
+        union = probs.sum(dims) + targets.sum(dims)
+
+        dice = (2. * intersection + self.eps) / (union + self.eps)
+        return 1.0 - dice.mean()
+
+
 #note, will overwrite smoothed loss
 class FocalLoss(nn.Module):
     # Original FocalLoss implementation (scalar alpha)

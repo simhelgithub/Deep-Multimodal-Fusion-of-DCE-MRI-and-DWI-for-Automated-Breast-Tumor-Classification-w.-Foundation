@@ -8,7 +8,10 @@ from dataset import *
 import torch.nn.functional as F 
 from foundation_model import *
 from preprocess_helpers import *
-
+from selector_helpers import *
+import pytorch_lightning as pl
+from train import *
+from run_training import *
 '''
  preprocess data for a single model (dce/dwi)
 
@@ -90,6 +93,7 @@ def prepare_single_custom_model(method, fold, parameters, device):
   # ---------
   if (parameters[f"{method}_model_parameters"]["use_backbone"]): 
     backbone = build_medical_backbone(parameters, device=device, method=method, in_channels=channel_num)
+    assert(backbone is not None)
   else:
     backbone = None
   #----
@@ -173,7 +177,47 @@ def prepare_single_custom_model(method, fold, parameters, device):
   return local_model, dataloaders_dict, key, labels[0], backbone
 
 
+def prepare_single_model_dynamic(method, fold, parameters, device, load_pretrained=False, ver_nr=1):
+    """
+    Prepare a single modality model (DWI/DCE) for training, or load pretrained.
+    Returns:
+        - local_model: LightningSingleModel
+        - dataloaders_dict: dict of DataLoaders
+        - key: model key string
+        - train_labels: labels for first split
+        - backbone: optional backbone module
+    """
+    # --- Preprocessing, datasets, dataloaders ---
+    local_model, dataloaders_dict, key, train_labels, backbone = prepare_single_custom_model(
+        method, fold, parameters, device
+    )
 
+    # --- Always prepare optimizer/scheduler for fusion ---
+    criterion_clf = get_classification_loss(parameters, train_labels, method, device)
+
+    lightning_model = LightningSingleModel(
+        model=local_model,
+        method=method,
+        criterion_clf=criterion_clf,
+        optimizer_fn=None,  # set later if training
+        scheduler_fn=None,
+        parameters_dict=parameters,
+        paths=prepare_output_paths(method, fold, parameters)
+    ).to(device)
+
+    if load_pretrained:
+        ckpt_path = os.path.join("results", method, f"fold_{fold}", "checkpoints", f"best-v{ver_nr}.ckpt")
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+        # Load weights into lightning_model while keeping optimizer param groups intact
+        ckpt_dict = torch.load(ckpt_path, map_location=device)
+        model_state = ckpt_dict['state_dict'] if 'state_dict' in ckpt_dict else ckpt_dict
+        lightning_model.load_state_dict({k.replace("model.", ""): v for k, v in model_state.items()}, strict=False)
+
+        print(f"[INFO] Loaded pretrained {method.upper()} model from {ckpt_path}")
+
+    return lightning_model, dataloaders_dict, key, train_labels, backbone
 
 
 '''

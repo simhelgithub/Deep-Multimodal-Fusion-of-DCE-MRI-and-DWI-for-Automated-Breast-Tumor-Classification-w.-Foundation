@@ -133,23 +133,29 @@ def run_debug_suite_single(model_module, method, parameters, device):
         "feat_norm": feat_norm_val,
     }
 
+
     # ===================================================================
     # MC DROPOUT — VALIDATE VARIATION
     # ===================================================================
     mc_mean, mc_std = model_module.predict_mc_dropout(model_module.model, x, passes=6)
     print("\nMC dropout OK. mean shape:", mc_mean.shape, " std shape:", mc_std.shape)
 
-    if mc_std.mean() < 0.0005:
-        print("! WARNING: MC dropout variance extremely small — dropout may NOT be active!")
-    else:
-        print("+ MC variance looks reasonable:", float(mc_std.mean()))
-    print("MC mean var:", float(mc_std.mean()))
+    # Compute a small expected threshold based on batch size and number of classes
+    B, num_classes = x.size(0), mc_mean.size(1)
+    expected_var_threshold = 1e-5 * B * num_classes  # scale with batch size and classes
 
+    mc_std_mean = float(mc_std.mean())
+    if mc_std_mean < expected_var_threshold:
+        print(f"! WARNING: MC dropout variance extremely small ({mc_std_mean:.6g}) — dropout may NOT be active!")
+    else:
+        print(f"+ MC variance looks reasonable: {mc_std_mean:.6g}")
+
+    print("MC mean var:", mc_std_mean)
     # ===================================================================
     # TTA — CHECK TRANSFORM EFFECT
     # ===================================================================
     base_pred = torch.softmax(out, dim=1)
-    tta_pred = model_module.predict_tta(model_module.model, x, masks)
+    tta_pred, _  = model_module.predict_tta(model_module.model, x, masks, return_aux=False)
 
     diff = (tta_pred - base_pred).abs().mean()
     print("\nTTA OK. out shape:", tta_pred.shape)
@@ -173,9 +179,9 @@ def run_debug_suite_single(model_module, method, parameters, device):
     # ===================================================================
     # predict_custom CROSS-CHECK
     # ===================================================================
-    pm = model_module.predict_custom(batch, mode="mc", mc_passes=3)
-    pt = model_module.predict_custom(batch, mode="tta")
-    ptm = model_module.predict_custom(batch, mode="tta_mc", mc_passes=3)
+    pm,_ = model_module.predict_custom(batch, mode="mc", mc_passes=3)
+    pt,_ = model_module.predict_custom(batch=batch, mode="tta")
+    ptm, _ = model_module.predict_custom(batch, mode="tta_mc", mc_passes=3)
 
     print("\npredict_custom(mc) OK")
     print("predict_custom(tta) OK")

@@ -102,7 +102,7 @@ class NyulStandardizer:
           # compute img-specific percentiles
           orig_perc = np.percentile(x.flatten(), self.landmarks)
 
-            #  map to average landmarks
+          #  map to average landmarks
           avg_perc = self.channel_landmarks[c]
 
           mid = np.interp(x.flatten(), orig_perc, avg_perc)
@@ -119,13 +119,15 @@ class NyulStandardizer:
 
         return out
     def save(self, path):
-        np.save(path, self.channel_landmarks, self.fitted)
-        print(f"Nyúl landmarks saved to: {path}")
+        np.save(path, {
+            "channel_landmarks": self.channel_landmarks,
+            "fitted": self.fitted
+        })
 
     def load(self, path):
-        self.channel_landmarks = np.load(path, allow_pickle=True).item()
-        self.fitted = True
-        print(f"Nyúl landmarks loaded from: {path}")
+        data = np.load(path, allow_pickle=True).item()
+        self.channel_landmarks = data["channel_landmarks"]
+        self.fitted = data["fitted"]
 
 
 def compute_adc_map(dwi_imgs, bvals, eps=1e-6):

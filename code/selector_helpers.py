@@ -1,4 +1,5 @@
 import torch
+from torch._dynamo.decorators import skip
 import torch.nn as nn
 import torch.optim as optim
 from torchmetrics.segmentation import DiceScore
@@ -95,12 +96,15 @@ def mask_criterion_selector(parameters, model_type):
   mask_parameters = parameters[f"{model_type}_model_parameters"]['mask_parameters']
   mask_enabled = mask_parameters["mask"]
   mask_loss_type = mask_parameters["mask_loss_type"] 
+  mask_dce_weight = mask_parameters['bce_weight']
+  mask_dice_weight = mask_parameters['dice_weight']
   mask_criterion = None
   if mask_enabled:
     if mask_loss_type == "dice":
-        #mask_criterion = DiceLoss()
-        mask_criterion = DiceScore(num_classes=2, average='macro') #num classes 2
-   
+        mask_criterion = SoftDiceLoss()
+    elif mask_loss_type == "dice_bce":
+        mask_criterion = DiceBCELoss(bce_weight=1.0, dice_weight=1.0)
+
     else:
         raise ValueError(f"Invalid mask loss: {mask_loss_type}")
     ''' #no longer supported
@@ -109,13 +113,16 @@ def mask_criterion_selector(parameters, model_type):
     '''
   return mask_criterion
 
-#todo split up a bit
+
+# todo make all after this less ugly
+@torch._dynamo.disable
 class LightningOptimizerFactory:
     """
-    - Splits parameters into backbone vs non-backbone (by name prefix "backbone").
-    - Builds backbone depth groups (for freezing/unfreezing).
-    - Optionally builds discriminative LR groups **from non-backbone params only**.
-    - Provides clear debug printing of named groups.
+    Single-model optimizer factor:
+    - Groups: [backbone, block1+block2, block3+other]
+    - backbone freezing
+    - Gradual unfreeze (deep → shallow)
+    - Discriminative LR 
     """
 
     def __init__(self, model: torch.nn.Module, parameters: dict, model_type: str):
@@ -124,174 +131,141 @@ class LightningOptimizerFactory:
         self.model_type = model_type
         self.config = parameters[f"{model_type}_model_parameters"]
 
-        # config knobs
-        self.num_backbone_groups = parameters.get("backbone_num_groups", 3)
+        #self.num_backbone_groups = parameters.get("backbone_num_groups", 3)
         self.backbone_freeze_on_start = parameters.get("backbone_freeze_on_start", True)
+        self.layers_unfrozen = 0
+        self.use_backbone = self.config["use_backbone"]
 
-        # ----- collect named params -----
-        # list of (name, param)
-        named = list(self.model.named_parameters())
-
-        # split backbone vs non-backbone by prefix "backbone"
-        self.backbone_named = [(n, p) for (n, p) in named if n.startswith("backbone")]
-        self.non_backbone_named = [(n, p) for (n, p) in named if not n.startswith("backbone")]
-
-        # build backbone groups (named) by depth
-        self.backbone_named_groups = self.group_params_by_depth_named(
-            self.backbone_named, num_groups=self.num_backbone_groups
+        # --- canonical grouping ---
+        self.named_groups = self.group_model_with_backbone_params(
+            model,
+            use_backbone=self.use_backbone
         )
 
-        # also build non-backbone (head) depth groups (named)
-        # helpful for discriminative LR if you want it on head
-        self.non_backbone_named_groups = self.group_params_by_depth_named(
-            self.non_backbone_named, num_groups=self.num_backbone_groups
-        )
-
-        # prepare simple param lists for optimizer usage (un-named)
-        self.backbone_groups = [[p for (_, p) in g] for g in self.backbone_named_groups]
-        self.non_backbone_groups = [[p for (_, p) in g] for g in self.non_backbone_named_groups]
-
-        # debug print
-        if self.parameters["backbone_debug"]:
-          self.print_grouping_debug(self.backbone_named_groups, tag="BACKBONE GROUPS")
-          self.print_grouping_debug(self.non_backbone_named_groups, tag="NON-BACKBONE (HEAD) GROUPS")
-
-        # Freeze backbone initially if requested
-        if self.backbone_freeze_on_start:
-            self._backbone_freeze_all()
-
-        # Build optimizer + scheduler factories
+        # freeze if requested
+        if self.backbone_freeze_on_start and self.use_backbone:
+            self.backbone = self.named_groups[0]
+            assert(self.backbone is not None) 
+            self.freeze_backbone()
         self.optimizer_fn = self._build_optimizer()
         self.scheduler_fn = self._build_scheduler()
 
-    # ---------------------
-    # Helper: group named params by "depth"
-    # ---------------------
-    def group_params_by_depth_named(self, named_params, num_groups=3):
-        """
-        named_params: list of (name, param)
-        Returns: list of groups, each group is list of (name, param)
-        Grouping is done by counting '.' in the name (depth) and slicing sorted list.
-        """
-        if not named_params:
-            return []
+    # ------------------------------------------------------------------
+    # Grouping  
+    # ------------------------------------------------------------------
+    @staticmethod
+    def group_model_with_backbone_params(model, use_backbone=True):
+        backbone, block1, block2, block3, other = [], [], [], [], []
 
-        # compute depth
-        items = [(name.count("."), name, p) for (name, p) in named_params]
-        items.sort(key=lambda x: x[0])  # shallow -> deep
+        for name, p in model.named_parameters():
+            if "classification_head" in name:
+                continue
+            if use_backbone and ("backbone" in name or "backbone_neck" in name):
+                backbone.append((name, p))
+            elif "block1" in name:
+                block1.append((name, p))
+            elif "block2" in name:
+                block2.append((name, p))
+            elif "block3" in name:
+                block3.append((name, p))
+            else:
+                other.append((name, p))
 
-        group_size = max(1, len(items) // num_groups)
-        groups = []
-        for i in range(num_groups):
-            start = i * group_size
-            end = (i + 1) * group_size if i < num_groups - 1 else len(items)
-            slice_items = items[start:end]
-            groups.append([(name, p) for (_, name, p) in slice_items])
+        if use_backbone:
+            block2 = block1 + block2
+            block1 = backbone
+
+        groups = [block1, block2, block3 + other]
+
+        print(f"[DEBUG] Single-model group sizes: {[len(g) for g in groups]}")
         return groups
 
-    # ---------------------
-    # Freeze/unfreeze helpers
-    # ---------------------
-    def _backbone_freeze_all(self):
-        for group in self.backbone_groups:
-            for p in group:
-                p.requires_grad = False
-
-    def _unfreeze_group(self, group_index):
-        cnt = 0
-        for p in self.backbone_groups[group_index]:
-            if not p.requires_grad:
-                p.requires_grad = True
-                cnt += 1
-        print(f"[DEBUG] Unfroze backbone group {group_index}: {cnt} params now trainable")
-        
-
-    def gradual_unfreeze(self, epoch, unfreeze_every_n_epochs=2):
-        num_groups = len(self.backbone_groups)
-        if num_groups == 0:
+    # ------------------------------------------------------------------
+    # Freezing
+    # ------------------------------------------------------------------
+    def freeze_backbone(self):
+        if not self.use_backbone:
             return
+        for _, p in self.named_groups[0]:  
+            p.requires_grad = False
+        print(f"[INFO] Backbone fully frozen ({len(list(self.named_groups[0]))} params)")
 
-        # which group index to unfreeze at this epoch?
-        group_to_unfreeze = epoch // unfreeze_every_n_epochs
+    def unfreeze_backbone(self):
+        if not self.use_backbone:
+            return
+        newly = []
+        cnt = 0
+        for name, p in self.named_groups[0]:
+            if not p.requires_grad: 
+              p.requires_grad = True
+              cnt += 1
+              newly.append((name,p))
+        print(f"[INFO] Backbone fully unfrozen ({cnt} params)")
+        return newly
 
-        # group indices: [0,1,2] shallow→deep  
-        # but we want to unfreeze from deep→shallow
-        group_to_unfreeze = num_groups - 1 - group_to_unfreeze
+    
+    def sync_unfrozen_params_to_optimizer(self, optimizer, newly_unfrozen):
+        if not newly_unfrozen:
+            return
+        existing = {id(p) for g in optimizer.param_groups for p in g["params"]}
+        new_params = [p for (name, p) in newly_unfrozen if id(p) not in existing]
 
-        if 0 <= group_to_unfreeze < num_groups:
-            self._unfreeze_group(group_to_unfreeze)
-    def _filter_trainable(self, group):
-        return [p for p in group if p.requires_grad]
+        lr = self.parameters.get("foundation_model_unfreeze_lr", 1e-6)
+        wd =  self.parameters.get("fondation_model_unfreeze_wd", 0)
 
-    # ---------------------
-    # base optimizer builder
-    # ---------------------
+        optimizer.add_param_group({"params": new_params, "lr": lr, "weight_decay": wd})
+        print(f"[INFO] sync: Added {len(new_params)} newly-unfrozen params to optimizer with lr={lr:.6g}, wd={wd:.6g}")
+
+    # ------------------------------------------------------------------
+    # Optimizer + discriminative LR
+    # ------------------------------------------------------------------
     def _get_base_optimizer(self, params, cfg):
-        opt_name = cfg["optimizer_parameters"]["name"].lower()
         p = cfg["optimizer_parameters"]
-        if opt_name == "adamw":
-            return torch.optim.AdamW(params, lr=p["lr"], eps=p["eps"], betas=p["betas"],
-                                     amsgrad=p.get("amsgrad", False), weight_decay=p["weight_decay"])
-        elif opt_name == "adam":
-            return torch.optim.Adam(params, lr=p["lr"], eps=p["eps"], betas=p["betas"],
-                                     amsgrad=p.get("amsgrad", False), weight_decay=p["weight_decay"])
-        else:
-            raise ValueError(f"Unsupported optimizer: {opt_name}")
+        name = p["name"].lower()
+        if name == "adamw":
+            return torch.optim.AdamW(
+                params, lr=p["lr"], betas=p["betas"], eps=p["eps"],
+                weight_decay=p["weight_decay"], amsgrad=p.get("amsgrad", False)
+            )
+        if name == "adam":
+            return torch.optim.Adam(
+                params, lr=p["lr"], betas=p["betas"], eps=p["eps"],
+                weight_decay=p["weight_decay"], amsgrad=p.get("amsgrad", False)
+            )
+        raise ValueError(name)
 
-    # ---------------------
-    # Build optimizer (clean)
-    # ---------------------
     def _build_optimizer(self):
+        """
+        Build optimizer with optional discriminative LR and discriminative weight decay.
+        Backbone freezing/unfreezing is handled as all-or-nothing.
+        """
         cfg = self.config
         p = cfg["optimizer_parameters"]
-        use_discriminative_lr = p.get("discriminative_lr", False)
-
-        # If no discriminative LR single param group: all trainable params
-        if not use_discriminative_lr:
-            # return factory: lightning expects a lambda or function taking params arg
-            return lambda params: self._get_base_optimizer(params, cfg)
-
-        # If discriminative LR: we build param groups from non-backbone (head) or from backbone
-        num_groups = p.get("num_lr_groups", self.num_backbone_groups)
+        base_lr = p.get("lr", 1e-4)
+        weight_decay = p.get("weight_decay", 0.0)
         lr_decay_factor = p.get("lr_decay_factor", 2.0)
-        weight_decay = p.get("weight_decay", p.get("weight_decay", 0.0))
-        base_lr = p.get("lr", 1e-3)
-
+        use_discriminative_lr = p.get("discriminative_lr", False)
         use_discriminative_reg = p.get("discriminative_reg", False)
-        reg_base = p.get("reg_base", weight_decay)        # default to normal WD if not set
-        reg_decay_factor = p.get("reg_decay_factor", 2.0) # deeper groups get reg_base * factor^k
+        reg_base = p.get("reg_base", weight_decay)
+        reg_decay_factor = p.get("reg_decay_factor", 2.0)
 
-        # Choose where to apply discriminative LR. Use config flag 'discrim_on' if present.
-        discrim_on = cfg.get("discrim_on", "all")  # options: "non_backbone" or "backbone" or "all"
-        if discrim_on == "backbone":
-            named_groups_for_discrim = self.backbone_named_groups
-        elif discrim_on == "all":
-            # combine backbone + non-backbone named lists into one sequence
-            named_groups_for_discrim = self.group_params_by_depth_named(
-                self.backbone_named + self.non_backbone_named, num_groups=num_groups
-            )
-        else:
-            # default: non-backbone
-            named_groups_for_discrim = self.non_backbone_named_groups
+        named_groups = self.named_groups
 
-        # Build param groups (only include trainable params)
+
         param_groups = []
-        # deepest group (last) should get highest LR; we'll iterate shallow->deep but compute LR accordingly
-        groups = named_groups_for_discrim
-        n_groups = max(1, len(groups))
-        for i, named_group in enumerate(groups):
-            params_list = [p for (n, p) in named_group if p.requires_grad]
+        n_groups = max(1, len(named_groups))
+        for i, group in enumerate(named_groups):
+            params_list = [p for (n, p) in group if p.requires_grad]
             if not params_list:
                 continue
-            # -----------------------------
-            # LR: deeper → larger LR
-            # -----------------------------
-            lr = base_lr / (lr_decay_factor ** (n_groups - 1 - i))
-            # -----------------------------
-            # Discriminative REG: deeper → larger WD
-            # -----------------------------
+
+            # Learning rate: deeper group → higher LR
+            if use_discriminative_lr:
+              lr = base_lr / (lr_decay_factor ** (n_groups - 1 - i))
+            else:
+              lr = base_lr
+            # Weight decay: discriminative if enabled
             if use_discriminative_reg:
-                # shallow group gets reg_base, deep gets reg_base * factor^(n_groups-1)
                 wd = reg_base * (reg_decay_factor ** (n_groups - 1 - i))
             else:
                 wd = weight_decay
@@ -301,20 +275,19 @@ class LightningOptimizerFactory:
                 "lr": lr,
                 "weight_decay": wd,
             })
+            
 
-        # As a safety: if param_groups is empty, fall back to all trainable params
+        # Safety fallback
         if not param_groups:
-            all_trainable = [p for (n, p) in (self.backbone_named + self.non_backbone_named) if p.requires_grad]
+            print('no param groups')
+            all_trainable = [p for (n, p) in (named_groups) if p.requires_grad]
             param_groups = [{"params": all_trainable, "lr": base_lr, "weight_decay": weight_decay}]
 
-        # Debug print of final discriminative grouping
-        self.print_param_group_summary(param_groups, tag="FINAL DISCRIM PARAM GROUPS")
-
-        # Return factory that builds the optimizer from the param_groups
+        self.print_param_group_summary(param_groups, tag="FINAL OPTIMIZER PARAM GROUPS")
         return lambda _: self._get_base_optimizer(param_groups, cfg)
 
     # ---------------------
-    # Build LR scheduler (unchanged semantics)
+    # Build LR scheduler  
     # ---------------------
     def _build_scheduler(self):
         sch_cfg = self.config.get("scheduler", None)
@@ -357,8 +330,6 @@ class LightningOptimizerFactory:
             return _scheduler
 
         raise ValueError(f"Unknown scheduler: {name}")
-
-
     # ---------------------
     # Debug print helpers
     # ---------------------
@@ -380,11 +351,11 @@ class LightningOptimizerFactory:
             wd = g.get("weight_decay", None)
             print(f"  ParamGroup {i}: count={cnt}  lr={lr}  wd={wd}")
         print("-"*60 + "\n")
-        
-        
+
+
+@torch._dynamo.disable
 class LightningFusionOptimizerFactory:
     """
-    Fusion-ready optimizer factory with full feature parity:
     - Gradual unfreeze of DWI/DCE: backbone / block1+2 / block3
     - Keeps fusion head always trainable
     - Supports discriminative LR and weight decay
@@ -401,82 +372,248 @@ class LightningFusionOptimizerFactory:
         # Config knobs
         self.num_backbone_groups = parameters.get("backbone_num_groups", 3)
         self.backbone_freeze_on_start = parameters.get("backbone_freeze_on_start", True)
+        self.layers_unfrozen = 0
 
-        # Split DWI and DCE into gradual-unfreeze groups
-        self.dwi_named_groups = self.group_model_with_backbone_params(dwi_model)
-        self.dce_named_groups = self.group_model_with_backbone_params(dce_model)
+        # Split DWI and DCE into gradual-unfreeze groups & remove classifciation heads
+        self.dwi_named_groups = self.group_model_with_backbone_params(dwi_model, use_backbone=self.parameters["dwi_model_parameters"]["use_backbone"], expected_num_groups=self.num_backbone_groups)
+        self.dce_named_groups = self.group_model_with_backbone_params(dce_model, use_backbone=self.parameters["dce_model_parameters"]["use_backbone"], expected_num_groups=self.num_backbone_groups)
         self.fusion_named = list(fusion_model.named_parameters())  # always trainable
-
-        # Prepare un-named param lists for convenience
-        self.dwi_groups = [[p for (_, p) in g] for g in self.dwi_named_groups[:-1]]  # ignore head
-        self.dce_groups = [[p for (_, p) in g] for g in self.dce_named_groups[:-1]]  # ignore head
-        self.fusion_params = [p for (_, p) in self.fusion_named]
+        
 
         # Freeze DWI/DCE backbones if requested
         if self.backbone_freeze_on_start:
-            self._freeze_all_backbone_groups()
+            self._freeze_all_backbone_groups()        
+            self.newly_unfrozen_groups = []
 
         # Build optimizer + scheduler factories
         self.optimizer_fn = self._build_optimizer()
         self.scheduler_fn = self._build_scheduler()
 
+
     # ---------------------
     # Parameter grouping
     # ---------------------
     @staticmethod
-    def group_model_with_backbone_params(model):
+    def group_model_with_backbone_params(model, use_backbone=True, expected_num_groups=3):
         """
-        Return named parameter groups for gradual unfreezing:
-        - backbone
-        - block1 + block2
-        - block3
-        - head: classification/mask/projectors
+        Name-based grouping with safer handling:
+          - groups: [backbone, (block1+block2), block3+other]
+        Skips classification/mask/projector heads listed in skip_prefixes.
+        Returns list of groups where each group is list of (name, param).
         """
-        backbone_params, shallow_params, deep_params, head_params = [], [], [], []
-
+        backbone_params, block1_params, block2_params, block3_params, other_params = [], [], [], [], []
+        # ensure tuple
         for name, p in model.named_parameters():
-            if name.startswith("backbone") or name.startswith("backbone_neck"):
-                backbone_params.append((name, p))
-            elif name.startswith("block1") or name.startswith("block2"):
-                shallow_params.append((name, p))
-            elif name.startswith("block3"):
-                deep_params.append((name, p))
-            elif (name.startswith("classification_head") or
-                  name.startswith("mask_head") or
-                  name.startswith("proj_f") or
-                  name.startswith("proj_r") or
-                  name.startswith("mask_spatial_attention")):
-                head_params.append((name, p))
-            else:
-                head_params.append((name, p))  # catch any others
-        return [backbone_params, shallow_params, deep_params, head_params]
+          #print(name)
+          # skip unwanted heads
+          if "classification_head" in name:
+              continue
+          if use_backbone and ("backbone" in name or "backbone_neck" in name):
+              backbone_params.append((name, p))
+          elif "block1" in name:
+              block1_params.append((name, p))
+          elif "block2" in name:
+              block2_params.append((name, p))
+          elif "block3" in name:
+              block3_params.append((name, p))
+          else:
+              other_params.append((name, p))
 
+
+        if use_backbone:
+            # combine block1+block2 
+            block2_params = block1_params + block2_params
+            block1_params = backbone_params
+
+        groups = [block1_params, block2_params, block3_params + other_params]
+
+        # Debug: print sizes so you can detect collapsed grouping early
+        print(f"[DEBUG] group_model_with_backbone_params sizes: {[len(g) for g in groups]}")
+        
+        return groups
     # ---------------------
-    # Freeze/unfreeze helpers
+    # Freezing
     # ---------------------
     def _freeze_all_backbone_groups(self):
-        for group in self.dwi_groups + self.dce_groups:
-            for p in group:
-                p.requires_grad = False
+        # Freeze DWI: operate on the real model parameters
+        for name, p in self.dwi_model.named_parameters():
+            p.requires_grad = False
+        # Freeze DCE
+        for name, p in self.dce_model.named_parameters():
+            p.requires_grad = False
 
-    def _unfreeze_group(self, group):
+        # Debug print 
+        print("[DEBUG] After freeze: trainable params (DWI):")
+        for name, p in self.dwi_model.named_parameters():
+            if p.requires_grad:
+                print("  (still trainable!)", name)
+        print("[DEBUG] After freeze: trainable params (DCE):")
+        for name, p in self.dce_model.named_parameters():
+            if p.requires_grad:
+                print("  (still trainable!)", name)
+
+
+    def _build_optimizer(self):
+        """
+        Build the initial optimizer factory. If backbone_freeze_on_start is True,
+        backbone groups are excluded from optimizer initially (only fusion head included).
+        """
+        cfg = self.parameters["fusion_model_parameters"]
+        p = cfg["optimizer_parameters"]
+        use_discriminative_lr = p.get("discriminative_lr", False)
+        freeze_backbone = self.backbone_freeze_on_start
+
+        # If not discriminative LR, create a single param group (Lightning will pass params)
+        if not use_discriminative_lr:
+            return lambda params: self._get_base_optimizer(params, cfg)
+
+        # Discriminative LR: build named group sequence
+        lr_decay_factor = p.get("lr_decay_factor", 2.0)
+        weight_decay = p.get("weight_decay", 0.0)
+        base_lr = p.get("lr", 1e-3)
+        use_discriminative_reg = p.get("discriminative_reg", False)
+        reg_base = p.get("reg_base", weight_decay)
+        reg_decay_factor = p.get("reg_decay_factor", 2.0)
+
+        # Merge groups by depth (dce groups then dwi groups)
+        num_backbone_groups = max(len(self.dce_named_groups), len(self.dwi_named_groups))
+        merged_groups = []
+        for i in range(num_backbone_groups):
+            g = []
+            if i < len(self.dce_named_groups):
+                g += self.dce_named_groups[i]
+            if i < len(self.dwi_named_groups):
+                g += self.dwi_named_groups[i]
+            merged_groups.append(g)
+
+        # Always append fusion head as the last group
+        merged_groups.append(self.fusion_named)
+
+        param_groups = []
+        n_groups = max(1, len(merged_groups))
+        for i, named_group in enumerate(merged_groups):
+            # collect parameters (named_group is list of (name, param))
+            params_list = [p for (_n, p) in named_group]
+
+            # If backbone is frozen on start, exclude backbone groups from initial optimizer
+            if freeze_backbone and i < (n_groups - 1):
+                params_list = []
+
+            if not params_list:
+                continue
+
+            lr = base_lr / (lr_decay_factor ** (n_groups - 1 - i))
+            wd = (reg_base * (reg_decay_factor ** (n_groups - 1 - i))) if use_discriminative_reg else weight_decay
+
+            param_groups.append({"params": params_list, "lr": lr, "weight_decay": wd})
+
+        # Safety fallback: everything
+        if not param_groups:
+            all_params = [p for (n, p) in (list(self.dwi_model.named_parameters()) +
+                                          list(self.dce_model.named_parameters()) +
+                                          list(self.fusion_named))]
+            param_groups = [{"params": all_params, "lr": base_lr, "weight_decay": weight_decay}]
+
+        self.print_param_group_summary(param_groups, tag="FINAL FUSION PARAM GROUPS (initial)")
+        return lambda _: self._get_base_optimizer(param_groups, cfg)
+  
+
+
+
+    def _unfreeze_named_group(self, named_group, model):
+        """
+        named_group: list of (name, param)
+        model: the actual model to modify
+        Returns: (count_unfrozen, list_of_newly_unfrozen_param_objects)
+        """
+        model_params = dict(model.named_parameters())
+        newly = []
         cnt = 0
-        for p in group:
-            if not p.requires_grad:
-                p.requires_grad = True
-                cnt += 1
-        return cnt
+        for name, _ in named_group:
+            if name in model_params:
+                mp = model_params[name]
+                if not mp.requires_grad:
+                    mp.requires_grad = True
+                    cnt += 1
+                    newly.append(mp)
+        return cnt, newly
 
-    def gradual_unfreeze(self, epoch, unfreeze_every_n_epochs=2):
-        group_idx = epoch // unfreeze_every_n_epochs
-        group_idx = self.num_backbone_groups - 1 - group_idx  # deep -> shallow
+    def gradual_unfreeze(self, epoch, unfreeze_every_n_epochs=20):
+        """
+        Unfreeze ONE next group at the scheduled epochs (deep->shallow).
+        Call from your LightningModule.on_train_epoch_start 
+        Returns list of newly unfrozen Parameter objects 
+        """
 
-        if 0 <= group_idx < self.num_backbone_groups:
-            cnt_dwi = self._unfreeze_group(self.dwi_groups[group_idx])
-            cnt_dce = self._unfreeze_group(self.dce_groups[group_idx])
-            print(f"[INFO] Epoch {epoch}: Unfroze DWI group {group_idx} ({cnt_dwi} params), "
-                  f"DCE group {group_idx} ({cnt_dce} params)")
+        # do not unfreeze at epoch 0
+        if epoch == 0:
+            return []
 
+        # only at exact multiples of unfreeze_every_n_epochs
+        if unfreeze_every_n_epochs <= 0 or epoch % unfreeze_every_n_epochs != 0:
+            return []
+
+        # how many steps already done
+        done_steps = self.layers_unfrozen
+        if done_steps >= self.num_backbone_groups:
+            return []  # nothing left to unfreeze
+
+        # determine which group to unfreeze (deep -> shallow)
+        # index 0 = deepest in your groups list, so pick:
+        group_idx = self.num_backbone_groups - 1 - done_steps
+        #group_idx = self.layers_unfrozen 
+        if group_idx < 0 or group_idx >= self.num_backbone_groups:
+            return []
+
+        dwi_named = self.dwi_named_groups[group_idx]
+        dce_named = self.dce_named_groups[group_idx]
+
+        cnt_dwi, new_dwi = self._unfreeze_named_group(dwi_named, self.dwi_model)
+        cnt_dce, new_dce = self._unfreeze_named_group(dce_named, self.dce_model)
+
+        newly = new_dwi + new_dce
+
+        if cnt_dwi > 0 or cnt_dce > 0:
+            print(f"[INFO] Epoch {epoch}: Unfroze ONLY group {group_idx} (DWI: {cnt_dwi}, DCE: {cnt_dce})")
+            # increment counter only when we actually unfreeze something
+            self.layers_unfrozen += 1
+        else:
+            print(f"[DEBUG] Epoch {epoch}: attempted to unfreeze group {group_idx} but nothing changed")
+
+        # return newly-unfrozen Parameter objects for downstream sync
+        return newly
+
+
+
+    def sync_unfrozen_params_to_optimizer(self, optimizer, newly_unfrozen_params):
+        """
+        Add newly_unfrozen_params (list of Parameter) to optimizer as a single param-group.
+        Ensures we do not add any parameter already present in optimizer.
+        """
+        if not newly_unfrozen_params:
+            print("[DEBUG] sync: no newly_unfrozen_params")
+            return
+
+        existing_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
+        to_add = [p for p in newly_unfrozen_params if isinstance(p, torch.nn.Parameter) and id(p) not in existing_ids]
+        if not to_add:
+            print("[DEBUG] sync: after filtering, nothing to add (maybe already present).")
+            return
+
+        # compute backbone lr/wd scheduling
+        base_lr = self.parameters.get("backbone_unfreeze_lr", 1e-4)
+        factor = self.parameters.get("backbone_unfreeze_lr_factor", 1.0)
+        backbone_lr = base_lr * (factor ** (self.layers_unfrozen - 1))  # note: layers_unfrozen already incremented in gradual_unfreeze
+
+        base_wd = self.parameters["dwi_model_parameters"]['optimizer_parameters'].get('reg_base', 0.0)
+        factor_wd = self.parameters["dwi_model_parameters"]['optimizer_parameters'].get('reg_decay_factor', 1.0)
+        wd = base_wd * (factor_wd ** (self.layers_unfrozen - 1))
+
+        optimizer.add_param_group({"params": to_add, "lr": backbone_lr, "weight_decay": wd})
+        print(f"[INFO] sync: Added {len(to_add)} newly-unfrozen params to optimizer with lr={backbone_lr:.6g}, wd={wd:.6g}")
+
+
+    
     # ---------------------
     # Base optimizer builder
     # ---------------------
@@ -492,47 +629,61 @@ class LightningFusionOptimizerFactory:
         else:
             raise ValueError(f"Unsupported optimizer: {opt_name}")
 
-    # ---------------------
-    # Build optimizer
-    # ---------------------
     def _build_optimizer(self):
         cfg = self.parameters["fusion_model_parameters"]
         p = cfg["optimizer_parameters"]
         use_discriminative_lr = p.get("discriminative_lr", False)
-
         if not use_discriminative_lr:
             return lambda params: self._get_base_optimizer(params, cfg)
 
-        num_groups = p.get("num_lr_groups", self.num_backbone_groups)
+        # gather config
         lr_decay_factor = p.get("lr_decay_factor", 2.0)
         weight_decay = p.get("weight_decay", 0.0)
         base_lr = p.get("lr", 1e-3)
-
         use_discriminative_reg = p.get("discriminative_reg", False)
         reg_base = p.get("reg_base", weight_decay)
         reg_decay_factor = p.get("reg_decay_factor", 2.0)
 
-        # Combine all named groups for discriminative LR
-        all_named_groups = self.dwi_named_groups[:-1] + self.dce_named_groups[:-1]  # backbone blocks only
-        all_named_groups.append(self.fusion_named)  # head always trainable
+        # merge DCE + DWI groups by depth
+        num_backbone_groups = max(len(self.dce_named_groups), len(self.dwi_named_groups))
+        merged_groups = []
 
+        if not self.backbone_freeze_on_start:
+          for i in range(num_backbone_groups):
+              group = []
+              if i < len(self.dce_named_groups):
+                  group += self.dce_named_groups[i]
+              if i < len(self.dwi_named_groups):
+                  group += self.dwi_named_groups[i]
+              if group:
+                  merged_groups.append(group)
+
+        # append fusion head as last group
+        merged_groups.append(self.fusion_named)
+
+        # build param groups with per-depth LR/WD
         param_groups = []
-        n_groups = len(all_named_groups)
-        for i, named_group in enumerate(all_named_groups):
-            trainable = [p for (n, p) in named_group if p.requires_grad]
-            if not trainable:
+        n_groups = len(merged_groups)
+        for i, named_group in enumerate(merged_groups):
+            params_list = [p for (_n, p) in named_group]
+            if not params_list:
                 continue
+            # deeper groups → larger LR
             lr = base_lr / (lr_decay_factor ** (n_groups - 1 - i))
-            wd = reg_base * (reg_decay_factor ** (n_groups - 1 - i)) if use_discriminative_reg else weight_decay
-            param_groups.append({"params": trainable, "lr": lr, "weight_decay": wd})
+            # discriminative WD if requested
+            wd = (reg_base * (reg_decay_factor ** (n_groups - 1 - i))) if use_discriminative_reg else weight_decay
+            param_groups.append({"params": params_list, "lr": lr, "weight_decay": wd})
 
-        # Fallback
         if not param_groups:
-            all_trainable = [p for g in all_named_groups for (_, p) in g if p.requires_grad]
-            param_groups = [{"params": all_trainable, "lr": base_lr, "weight_decay": weight_decay}]
+            # fallback: everything
+            all_params = [p for (n, p) in (list(self.dwi_model.named_parameters()) +
+                                          list(self.dce_model.named_parameters()) +
+                                          list(self.fusion_named))]
+            param_groups = [{"params": all_params, "lr": base_lr, "weight_decay": weight_decay}]
 
         self.print_param_group_summary(param_groups, tag="FINAL FUSION PARAM GROUPS")
         return lambda _: self._get_base_optimizer(param_groups, cfg)
+
 
     # ---------------------
     # Scheduler
@@ -590,4 +741,7 @@ class LightningFusionOptimizerFactory:
             print(f"  ParamGroup {i}: count={cnt}  lr={lr}  wd={wd}")
         print("-"*60 + "\n")
 
-        
+
+def remove_classification_head(named_params, head_prefixes=("fc", "classifier", "head")):
+    return [(n, p) for (n, p) in named_params 
+            if not n.startswith(head_prefixes)]

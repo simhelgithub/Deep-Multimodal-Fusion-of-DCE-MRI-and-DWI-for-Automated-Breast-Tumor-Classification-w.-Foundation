@@ -1,16 +1,22 @@
 import torch.nn as nn
 import torch as torch
-import torch.nn.functional as F # Import F for resizing
-from torch.nn import BatchNorm3d, init # Import the init module
+import torch.nn.functional as F 
 from loss import *
 import warnings
-
+from transformer_model import *
+from torch.nn import BatchNorm3d, Identity, init 
+from dataclasses import dataclass
 # -----------------------------
 # Small utilities & losses
 # -----------------------------
 
 def smooth_l1_loss(a, b):
     return F.smooth_l1_loss(a, b)
+
+@dataclass
+class FeatureSpec:
+    channels: int
+    stride: int
 
 
 # -----------------------------
@@ -28,7 +34,7 @@ class SEBlock(nn.Module):
         self.fc = nn.Sequential(
             AdaptiveAvgPool(1),
             Conv(channels, mid, kernel_size=1, bias=True),
-            nn.ELU(inplace=True),
+            nn.GELU(),
             Conv(mid, channels, kernel_size=1, bias=True),
             nn.Sigmoid()
         ) 
@@ -65,7 +71,7 @@ class MaskGuidedSpatialAttention(nn.Module):
         self.mask_processor = nn.Sequential(
             Conv(in_channels_mask, hidden_channels, 1, bias=False),
             BatchNorm(hidden_channels),
-            nn.ELU(inplace=True),
+            nn.GELU(),
             Conv(hidden_channels, 1, 1),
             nn.Sigmoid()  # produces attention in (0,1)
         )
@@ -91,7 +97,6 @@ class MaskGuidedSpatialAttention(nn.Module):
 
         # attention: modulate contrast of img_features
         out = img_features * (1 + self.gamma * A)
-
         return out, A
 
 
@@ -111,7 +116,7 @@ class ReconHead(nn.Module):
         self.conv = nn.Sequential(
             Convd(in_ch, in_ch, kernel_size=3, padding=1, bias=False),
             BatchNorm(in_ch),
-            nn.ELU(inplace=True),
+            nn.GELU(),
             Convd(in_ch, recon_ch, kernel_size=3, padding=1)
         )
         
@@ -140,7 +145,7 @@ class MaskHeadResize(nn.Module):
         self.out_size = out_size
 
         Conv = nn.Conv3d if dim == 3 else nn.Conv2d
-        Act = nn.ReLU
+        Act = nn.GELU
         mode = "trilinear" if dim == 3 else "bilinear"
         self.interp_mode = mode
 
@@ -150,34 +155,34 @@ class MaskHeadResize(nn.Module):
         # downsampling blocks
         self.down_64_to_32 = nn.Sequential(
             Conv(mid_ch, mid_ch, 3, stride=2, padding=1),
-            Act(inplace=True),
+            Act(),
         )
 
         self.down_128_to_32 = nn.Sequential(
             Conv(mid_ch, mid_ch, 3, stride=2, padding=1),  # 128 -> 64
-            Act(inplace=True),
+            Act(),
             Conv(mid_ch, mid_ch, 3, stride=2, padding=1),  # 64 -> 32
-            Act(inplace=True),
+            Act(),
         )
 
         self.down_256_to_32 = nn.Sequential(
             Conv(mid_ch, mid_ch, 3, stride=2, padding=1),  # 256 -> 128
-            Act(inplace=True),
+            Act(),
             Conv(mid_ch, mid_ch, 3, stride=2, padding=1),  # 128 -> 64
-            Act(inplace=True),
+            Act(),
             Conv(mid_ch, mid_ch, 3, stride=2, padding=1),  # 64 -> 32
-            Act(inplace=True),
+            Act(),
         )
 
         self.down_512_to_32 = nn.Sequential(
             Conv(mid_ch, mid_ch, 3, stride=2, padding=1),  # 512 -> 256
-            Act(inplace=True),
+            Act(),
             Conv(mid_ch, mid_ch, 3, stride=2, padding=1),  # 256 -> 128
-            Act(inplace=True),
+            Act(),
             Conv(mid_ch, mid_ch, 3, stride=2, padding=1),  # 128 -> 64
-            Act(inplace=True),
+            Act(),
             Conv(mid_ch, mid_ch, 3, stride=2, padding=1),  # 64 -> 32
-            Act(inplace=True),
+            Act(),
         )
 
 
@@ -233,6 +238,7 @@ class ResNetLiteBlock_withRecon(nn.Module):
         dropout=0.4,
         dim=2,
         num_repeats=1,  
+        downsample_each_repeat = False,
         mid_squeeze = 2
     ):
         super().__init__()
@@ -244,26 +250,29 @@ class ResNetLiteBlock_withRecon(nn.Module):
         Dropout = nn.Dropout3d if dim == 3 else nn.Dropout
 
         stride = 2 if downsample else 1
-        mid_ch = max(out_ch // 2, 1)
+        mid_ch = max(out_ch // mid_squeeze, 1)
 
         # Build repeated bottleneck layers
         self.bottlenecks = nn.ModuleList()
         for i in range(num_repeats):
-            b_stride = stride if i == 0 else 1  # only first bottleneck downsamples
+            if downsample_each_repeat:
+              b_stride = stride
+            else:
+              b_stride = stride if i == 0 else 1  # only first bottleneck downsamples
             self.bottlenecks.append(nn.Sequential(
                 Conv(in_ch if i == 0 else out_ch, mid_ch, kernel_size=1, stride=b_stride, bias=False),
                 BatchNorm(mid_ch),
-                nn.ELU(inplace=True),
+                nn.GELU(),
                 Dropout(p=dropout),
                 Conv(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False),
                 BatchNorm(mid_ch),
-                nn.ELU(inplace=True),
+                nn.GELU(),
                 Conv(mid_ch, out_ch, kernel_size=1, bias=False),
                 BatchNorm(out_ch)
             ))
 
 
-        self.act = nn.ELU(inplace=True)
+        self.act = nn.GELU()
         self.dropout = Dropout(p=dropout)
 
         # Skip connection over the entire stack
@@ -341,32 +350,7 @@ class Projector(nn.Module):
     def forward(self, x):
         return self.proj(x)
 
-#---
-# class for more complex backbone neck connection
-#--
 
-class BackboneNeck(nn.Module):
-    """
-    Neck to process backbone features before further blocks.
-    2D or 3D.
-    """
-    def __init__(self, in_ch, out_ch, dim = 2):
-        super().__init__()
-        Conv = nn.Conv3d if dim==3 else nn.Conv2d
-        BatchNorm = nn.BatchNorm3d if dim==3 else nn.BatchNorm2d
-        self.norm = nn.BatchNorm2d(out_ch) if dim==2 else nn.BatchNorm3d(out_ch)
-
-        self.neck = nn.Sequential(
-            Conv(in_ch, out_ch, kernel_size=3, padding=1),
-            BatchNorm(out_ch),
-            nn.GELU(),
-            Conv(out_ch, out_ch, kernel_size=3, padding=1),
-            BatchNorm(out_ch),
-            nn.GELU()
-        )
-
-    def forward(self, x):
-        return self.norm(self.neck(x))
 
 #---
 # classificaiton head
@@ -389,8 +373,116 @@ class ClassificationHead(nn.Module):
         x = self.pool(x)
         x = self.flatten(x)
         return self.fc(x)
+
+class FeatureDownAlign(nn.Module):
+    """
+    Align higher-resolution features (f1) to lower-resolution (f2)
+    using strided conv instead of interpolation if downsample=True.
+    Supports 2D and 3D.
+    """
+    def __init__(self, in_ch, out_ch, dim=2, downsample=True):
+        super().__init__()
+        assert dim in (2, 3)
+        Conv = nn.Conv3d if dim == 3 else nn.Conv2d
+        Norm = nn.BatchNorm3d if dim == 3 else nn.BatchNorm2d
+        stride = 2 if downsample else 1
+        kernel_size = 3 if downsample else 1
+        padding = 1 if downsample else 0
+        if in_ch != out_ch or downsample:
+          self.proj = nn.Sequential(
+              Conv(in_ch, out_ch, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
+              Norm(out_ch),
+              nn.GELU(),
+          )
+
+        else:
+            self.proj = nn.Identity()
+
+    def forward(self, x):
+        return self.proj(x)
+        
+#---
+# class for more complex backbone neck connection
+#--
+@torch._dynamo.disable
+class BackboneAdapter(nn.Module):
+    """
+    Adapts arbitrary backbone outputs into 3 features (f1/f2/f3).
+    Handles both CNN (spatial features) and transformer (token) backbones.
+    """
+
+    def __init__(
+        self,
+        backbone,
+        selected_indices_chains,   # list of lists, one per f1/f2/f3
+        out_channels=(64, 128, 256),
+        dim=2,
+        is_transformer=False,      # True if backbone outputs tokens
+    ):
+        super().__init__()
+
+        assert len(selected_indices_chains) == 3, "Must provide 3 chains for f1/f2/f3"
+        assert len(out_channels) == 3, "Must provide 3 output channels for f1/f2/f3"
+
+        self.backbone = backbone
+        self.selected_indices_chains = selected_indices_chains
+        self.dim = dim
+        self.is_transformer = is_transformer
+
+        Conv = nn.Conv3d if dim == 3 else nn.Conv2d
+        BN = nn.BatchNorm3d if dim == 3 else nn.BatchNorm2d
+
+        # Discover backbone feature hierarchy
+        info = backbone.feature_info
+        self.features = [
+            FeatureSpec(c, s) for c, s in zip(info.channels(), info.reduction())
+        ]
+
+        # Build necks for each feature chain
+        self.necks = nn.ModuleDict()
+        for i, indices_chain in enumerate(self.selected_indices_chains):
+            in_ch = sum([self.features[idx].channels for idx in indices_chain])
+            out_ch = out_channels[i]
+            self.necks[f'f{i+1}'] = nn.Sequential(
+                Conv(in_ch, out_ch, 3, padding=1),
+                BN(out_ch),
+                nn.GELU(),
+                Conv(out_ch, out_ch, 3, padding=1),
+                BN(out_ch),
+                nn.GELU(),
+            )
+
+    def forward(self, x):
+            feats = self.backbone(x)  # list of features from backbone
+            outputs = []
+
+            for i, indices_chain in enumerate(self.selected_indices_chains):
+                chain_feats = []
+                for idx in indices_chain:
+                    f = feats[idx]
+                    if self.is_transformer:
+                        if f.ndim == 3:
+                            # token sequence -> reshape to (B, C, H, W)
+                            B, N, C = f.shape
+                            H = W = int(N ** 0.5)
+                            f = f.permute(0, 2, 1).contiguous().view(B, C, H, W)
+                        elif f.ndim == 4:
+                            # already (B,C,H,W), nothing to do
+                            pass
+                        else:
+                            raise ValueError(f"Unexpected transformer feature shape: {f.shape}")
+                    chain_feats.append(f)
+
+                # Concatenate along channel dim and pass through neck
+                chain_feats = torch.cat(chain_feats, dim=1)
+                chain_out = self.necks[f'f{i+1}'](chain_feats)
+                outputs.append(chain_out)
+
+            # Unpack into f1_b, f2_b, f3_b
+            return outputs[0], outputs[1], outputs[2]
+
 # -------------------------
-# ModelMaskHead experimental backbone
+# ModelMaskHeadBackbone experimental backbone
 # -------------------------
 class ModelMaskHeadBackbone(nn.Module):
     """
@@ -410,7 +502,6 @@ class ModelMaskHeadBackbone(nn.Module):
         # --
         # Load settings
         # ---
-
         self.channel_num = parameters_dict[f'{method}_channel_num']
         self.num_classes = parameters_dict['class_num']
         self.dim = parameters_dict['dim']
@@ -418,17 +509,25 @@ class ModelMaskHeadBackbone(nn.Module):
         model_parameters =  parameters_dict[f'{method}_model_parameters']
         self.enable_modality_attention = model_parameters['enable_modality_attention']
         self.use_se = model_parameters['use_se']
-
+        self.use_hybrid_transformer = model_parameters["use_hybrid_transformer"]
+        self.use_backbone = model_parameters["use_backbone"]
         self.channels = model_parameters['channels']
         self.proj_dim = model_parameters['proj_dim']
         self.dropout = model_parameters['dropout']
         self.num_repeats = model_parameters['repeat_blocks']
         self.mid_squeeze = model_parameters['mid_squeeze']
+        self.downsample = model_parameters['downsample']
+        self.downsample_each_repeat = model_parameters['downsample_each_repeat']
+        self.selected_indices_chains = model_parameters['backbone_index_lists']
+        self.backbone_out_channels = model_parameters['backbone_out_channels'] # not implemented
+        self.transformer_backbone = model_parameters['transformer_backbone']
 
         mask_parameters =  model_parameters['mask_parameters']
         self.mask_enabled = mask_parameters["mask"]
         self.mask_stage =  mask_parameters["mask_stage"].lower()
         self.mask_size = mask_parameters['mask_target_size'][0]
+        
+
         # ------------------------
         # Config + channels
         # ------------------------
@@ -443,11 +542,16 @@ class ModelMaskHeadBackbone(nn.Module):
         # ------------------------
         # Backbone + neck
         # ------------------------
-        self.backbone = backbone
-        if self.backbone is not None:
-            self.backbone_out_dim = backbone.output_dim
-            self.backbone_neck = BackboneNeck(
-                in_ch=self.backbone_out_dim, out_ch=c1, dim=self.dim
+        self.backbone = torch._dynamo.disable(backbone) #disable dynamo for backbone or issues
+        #if self.backbone is not None:
+        if self.use_backbone:
+            #(c1,c2,c3,c4) = backbone.output_dims 
+            #print(backbone.output_dims)
+            self.backbone_adapter = BackboneAdapter(
+                backbone=self.backbone,
+                selected_indices_chains=self.selected_indices_chains,
+                out_channels=(c1,c1,c2),
+                is_transformer=self.transformer_backbone
             )
             block1_in = c1
         else:
@@ -457,14 +561,28 @@ class ModelMaskHeadBackbone(nn.Module):
         # Blocks
         # ------------------------
         self.block1 = ResNetLiteBlock_withRecon(
-            block1_in, c1, downsample=False, recon_ch=1, use_se=self.use_se, dim=self.dim, dropout = self.dropout, num_repeats=self.num_repeats[0], mid_squeeze=self.mid_squeeze
+            block1_in, c1, downsample=self.downsample[0], recon_ch=1, use_se=self.use_se, dim=self.dim, dropout = self.dropout, num_repeats=self.num_repeats[0], downsample_each_repeat = self.downsample_each_repeat, mid_squeeze=self.mid_squeeze
         )
         self.block2 = ResNetLiteBlock_withRecon(
-            c1, c2, downsample=True, recon_ch=1, use_se=self.use_se, dim=self.dim, dropout = self.dropout, num_repeats=self.num_repeats[1], mid_squeeze=self.mid_squeeze
+            c1, c2, downsample=self.downsample[1], recon_ch=1, use_se=self.use_se, dim=self.dim, dropout = self.dropout, num_repeats=self.num_repeats[1], downsample_each_repeat = self.downsample_each_repeat, mid_squeeze=self.mid_squeeze
         )
-        self.block3 = ResNetLiteBlock_withRecon(
-            c2, c3, downsample=True, recon_ch=0, use_se=self.use_se, dim=self.dim, dropout = self.dropout, num_repeats=self.num_repeats[2], mid_squeeze=self.mid_squeeze
-        )
+
+        if not self.use_hybrid_transformer:
+            self.block3 = ResNetLiteBlock_withRecon(c2, c3, downsample=self.downsample[2], recon_ch=0, use_se=self.use_se, dim=self.dim, dropout = self.dropout, num_repeats=self.num_repeats[2], downsample_each_repeat = self.downsample_each_repeat, mid_squeeze=self.mid_squeeze)
+        else:
+            # ---- HYBRID CNN → TRANSFORMER ----
+            self.transformer = TransformerStage(
+                in_ch=c2,
+                embed_dim=model_parameters['transformer_embed_dim'],
+                depth=model_parameters['transformer_depth'],
+                heads=model_parameters['transformer_heads'],
+                patch_size=model_parameters['transformer_patch_size'],
+                dim=self.dim
+            )
+
+            # project transformer features to c3 for heads
+            Conv = nn.Conv3d if self.dim == 3 else nn.Conv2d
+            self.trans_out_proj = Conv(model_parameters['transformer_embed_dim'], c3, kernel_size=1)
 
         # ------------------------
         # Modality attention
@@ -481,20 +599,33 @@ class ModelMaskHeadBackbone(nn.Module):
         # ------------------------
         # Mask head depends on mask_stage
         # ------------------------
+
         if self.mask_enabled:
+          #applied after the block, so downsample never needed
+          self.f1_to_f2 = FeatureDownAlign(c1, c2, dim=self.dim, downsample = False) 
+          self.f2_to_f3 =  FeatureDownAlign(c2, c3, dim=self.dim, downsample = False)  
+
           if self.mask_stage == "f1":
               mask_in = c1
-          elif self.mask_stage == "f2":
+          if self.mask_stage == "f2": 
               mask_in = c2
-          elif self.mask_stage == "f3":
+          if self.mask_stage == "f3":
               mask_in = c3
 
           self.mask_head = MaskHeadResize(in_ch = mask_in, out_size=self.mask_size, dim=self.dim)
 
-          # Spatial attention uses f3 and f1  
+          # Spatial attention 
           self.mask_spatial_attention = MaskGuidedSpatialAttention(
-              in_channels_img=c3, in_channels_mask=c1, dim=self.dim
+              in_channels_img=c3, in_channels_mask=1, dim=self.dim
           )
+          
+          
+          
+          if self.use_hybrid_transformer and self.mask_stage == "f3":
+              raise ValueError("mask_stage='f3' not supported with hybrid transformer")
+
+
+
 
         # Classification head (always uses f3)
         self.classification_head = ClassificationHead(
@@ -519,39 +650,49 @@ class ModelMaskHeadBackbone(nn.Module):
         else:
             x_in = x
             mod_attn_map = None
-
+        #f1_b, f2_b, f3_b = None, None, None
         # Optional backbone
-        if self.backbone is not None:
-            feats = self.backbone(x_in)
-            x_in = self.backbone_neck(feats)
-
+        if self.use_backbone:
+            f1_b, f2_b, f3_b = self.backbone_adapter(x_in)
         # ------------------------
-        # Encoder blocks
+        # Encoder blocks & mask head placements
         # ------------------------
-        f1, r1 = self.block1(x_in)
-        f2, r2 = self.block2(f1)
-        if self.mask_enabled:
-          f2_att, mask_attn_map = self.mask_spatial_attention(f2, f1)
+        #f1, r1 = self.block1(f1_b if f1_b is not None else x_in)
+        if self.use_backbone:
+            f1, r1 = self.block1(f1_b)
         else:
-          f2_att = f2
-          mask_attn_map = None
-        f3, _ = self.block3(f2_att)
+            f1, r1 = self.block1(x_in)
 
-        # ------------------------
-        # Mask head 
-        # ------------------------
-        if self.mask_enabled:
-          if self.mask_stage == "f1":
-              mask_pred = self.mask_head(f1)
-          elif self.mask_stage == "f2":
-              mask_pred = self.mask_head(f2)
-          elif self.mask_stage == "f3":
-              mask_pred = self.mask_head(f3)
-          else:
-              raise RuntimeError("Invalid mask_stage encountered.")
+        if self.mask_enabled and self.mask_stage == "f1":
+            mask_pred = self.mask_head(f1)
+            f1, mask_attn_map = self.mask_spatial_attention(f1, mask_pred)
+
+        #f2, r2 = self.block2(f1 + (f2_b if f2_b is not None else 0))
+        if self.use_backbone:
+            f2, r2 = self.block2(f1+f2_b)
         else:
-          mask_pred = None
+            f2, r2 = self.block2(f1)
+        if self.mask_enabled and self.mask_stage == "f2":
+            f1_aligned = self.f1_to_f2(f1)
+            f2_mask_input = f2 + f1_aligned
+            mask_pred = self.mask_head(f2_mask_input)
+            f2, mask_attn_map = self.mask_spatial_attention(f2, mask_pred)
+        # ---- Final stage, hybdir option ----
+        if not self.use_hybrid_transformer:
+            #f3, _ = self.block3(f2 + (f3_b if f3_b is not None else 0))
+            if self.use_backbone:
+                f3, _ = self.block3(f2+f3_b)
+            else:
+                f3, _ = self.block3(f2)
+            if self.mask_enabled and self.mask_stage == "f3":
+                f2_aligned = self.f2_to_f3(f2)
+                f3_mask_input = f3 + f2_aligned
+                mask_pred = self.mask_head(f3_mask_input)
+                f3, mask_attn_map = self.mask_spatial_attention(f3, mask_pred)
 
+        else:
+            f2_mid = self.transformer(f2)          # must keep spatial layout
+            f3 = self.trans_out_proj(f2_mid)                  
         # ------------------------
         # Projections
         # ------------------------
@@ -568,6 +709,7 @@ class ModelMaskHeadBackbone(nn.Module):
         # ------------------------
         # Classification
         # ------------------------
+
         logits = self.classification_head(f3)
         
         # ------------------------
@@ -639,32 +781,12 @@ class FusionReduce(nn.Module):
         self.reduce = nn.Sequential(
             Conv(in_ch, out_ch, kernel_size=1, bias=False),
             BatchNorm(out_ch),
-            nn.ELU(inplace=True)
+            nn.GELU(),
         )
     def forward(self, x):
         return self.reduce(x)
 
 
-class FusionRefine(nn.Module):
-    #Small residual refinement block for fused features
-    def __init__(self, channels, dim=2, dropout=0.3):
-        super().__init__()
-        Conv = nn.Conv3d if dim==3 else nn.Conv2d
-        BatchNorm = nn.BatchNorm3d if dim==3 else nn.BatchNorm2d
-        Dropout = nn.Dropout3d if dim==3 else nn.Dropout
-
-        self.refine = nn.Sequential(
-            Conv(channels, channels, 3, padding=1, bias=False),
-            BatchNorm(channels),
-            nn.ELU(inplace=True),
-            Dropout(p=dropout),
-            Conv(channels, channels, 3, padding=1, bias=False),
-            BatchNorm(channels),
-        )
-        self.act = nn.ELU(inplace=True)
-
-    def forward(self, x):
-        return self.act(x + self.refine(x))
 
 
 class CrossAttentionBlock(nn.Module):
@@ -678,7 +800,7 @@ class CrossAttentionBlock(nn.Module):
         self.attn_ffn = nn.Sequential(
             nn.LayerNorm(channels),
             nn.Linear(channels, channels),
-            nn.ELU(),
+            nn.GELU(),
             nn.Linear(channels, channels)
         )
 
@@ -731,8 +853,7 @@ class FusionModel(nn.Module):
 
         # reduce concat (2*fusion_channels -> fusion_channels)
         self.fusion_conv_reduce = FusionReduce(2*self.fusion_channels, self.fusion_channels, dim=self.dim)
-        self.refine_before_gating = FusionRefine(self.fusion_channels, dim=self.dim, dropout=self.dropout)
-        self.refine_act = nn.ELU(inplace=True)
+        self.refine_act = nn.GELU()
 
         # Optional SE block after residual refine
         if self.use_se_in_fusion:
@@ -742,8 +863,8 @@ class FusionModel(nn.Module):
 
         # gating attention (global)
         self.gating = GatingAttention(feat_dim=self.fusion_channels, use_mask_attention=self.use_mask_attention, dim =  self.dim)
-        self.refine_after_gating = FusionRefine(self.fusion_channels, dim=self.dim, dropout=self.dropout)
-        
+        self.refine = ResNetLiteBlock_withRecon(in_ch = self.fusion_channels, out_ch=self.fusion_channels, dim=self.dim, dropout=self.dropout, mid_squeeze = 2)
+
         # Optional cross-attention
         if self.use_cross_attention:
             self.cross_attn_block = CrossAttentionBlock(self.fusion_channels, num_heads=self.mha_heads)
@@ -753,7 +874,7 @@ class FusionModel(nn.Module):
         self.mask_head = MaskHeadResize(in_ch = self.fusion_channels, out_size=self.mask_size, dim=self.dim)
 
         # fusion reconstruction head (1x1)
-        self.fusion_reconstruct =ReconHead(in_ch=self.fusion_channels, recon_ch=self.fusion_recon_ch, upsample=False,dim=self.dim)
+        self.fusion_reconstruct = ReconHead(in_ch=self.fusion_channels, recon_ch=self.fusion_recon_ch, upsample=False,dim=self.dim)
 
 
         # classifier
@@ -808,9 +929,8 @@ class FusionModel(nn.Module):
         reduced = self.fusion_conv_reduce(cat)  # B, C, H, W
 
         # refine residual
-        residual = self.refine_before_gating(reduced)
+        residual, _ = self.refine(reduced)
         refined = self.refine_act(reduced + residual)
-
 
         # gating: use global pooled vectors from original projected deep features
         # pooled vectors
@@ -846,10 +966,11 @@ class FusionModel(nn.Module):
             fused = fused + up
 
         # Fusion refinement
-        fused_refined = self.refine_after_gating(fused)
         # optional use se
         if self.fusion_se is not None:
-            fused_refined, _ = self.fusion_se(fused_refined)
+            fused_refined, _ = self.fusion_se(fused)
+        else:
+            fused_refined = fused
         
         # mask (32x32)
         fused_mask_logits = self.mask_head(fused_refined)

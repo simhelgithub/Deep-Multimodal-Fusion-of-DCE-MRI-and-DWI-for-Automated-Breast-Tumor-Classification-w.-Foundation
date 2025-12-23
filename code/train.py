@@ -13,8 +13,8 @@ from torchmetrics import MeanMetric
 from loss import *
 from selector_helpers import *
 from torchmetrics.classification import MulticlassAUROC, MulticlassPrecision, MulticlassRecall, MulticlassF1Score, MulticlassConfusionMatrix
-VIZ_FREQUENCY = 10
 
+VIZ_FREQUENCY = 10
 
 class LightningSingleModel(pl.LightningModule):   
     def __init__(
@@ -57,7 +57,8 @@ class LightningSingleModel(pl.LightningModule):
 
 
         #unfreeze      
-        self.unfreeze_timer = int(self.parameters_dict["unfreeze_timer"])
+        self.use_backbone = model_params['use_backbone']
+        self.unfreeze_timer = int(self.parameters_dict["foundation_model_unfreeze_timer"])
         self.backbone_freeze_on_start = self.parameters_dict['backbone_freeze_on_start'] 
         self.backbone_num_groups = self.parameters_dict['backbone_num_groups']
         self.layers_unfrozen = 0
@@ -86,12 +87,19 @@ class LightningSingleModel(pl.LightningModule):
         self.debug_anomaly =parameters_dict["debug_anomaly"]
         torch.autograd.set_detect_anomaly(self.debug_anomaly) 
 
+        # aux loss weight scheduling, drops off towards epoch
+        self.use_aux_loss_sched = parameters_dict['use_simple_aux_loss_scheduling'] 
+        self.aux_loss_limit = parameters_dict["aux_loss_weight_epoch_limit"]
+
         
         # book keeping for some non standard metrics
-        self.best_val_acc = -1.0 #used to only save on best val acc
         self.latest_val_sample = None
-
-
+        #self.val_mod_attn = None
+        self.test_mod_attn = []
+        self.test_preds = []
+        self.test_targets = []
+        self.test_preds_array = []
+        self.test_targets_array = []
         #transform helpers for tta
         self.transforms_list = self.transforms_list = [ 
                 tta_id,
@@ -105,56 +113,61 @@ class LightningSingleModel(pl.LightningModule):
         # -------------------
         # TRAIN METRICS
         # -------------------
-        self.train_mask_loss   = MeanMetric()
-        self.train_recon_loss  = MeanMetric()
-        self.train_mimic_loss  = MeanMetric()
-        self.train_acc         = MeanMetric()
-        self.train_f1          = MulticlassF1Score(num_classes=self.class_num)
+        self.train_mask_loss   = MeanMetric().cpu()
+        self.train_recon_loss  = MeanMetric().cpu()
+        self.train_mimic_loss  = MeanMetric().cpu()
+        self.train_acc         = MeanMetric().cpu()
+        self.train_f1          = MulticlassF1Score(num_classes=self.class_num).cpu()
         # -------------------
         # VALIDATION METRICS
         # -------------------
-        self.val_mask_loss     = MeanMetric()
-        self.val_recon_loss    = MeanMetric()
-        self.val_mimic_loss    = MeanMetric()
+        self.val_mask_loss     = MeanMetric().cpu()
+        self.val_recon_loss    = MeanMetric().cpu()
+        self.val_mimic_loss    = MeanMetric().cpu()
+        self.val_acc           = MeanMetric().cpu()
+        self.val_roc_auc       = MulticlassAUROC(num_classes=self.class_num).cpu()
+        self.val_f1            = MulticlassF1Score(num_classes=self.class_num).cpu()
+        self.val_precision     = MulticlassPrecision(num_classes=self.class_num).cpu()
+        self.val_recall        = MulticlassRecall(num_classes=self.class_num).cpu()
+        self.val_confmat       = MulticlassConfusionMatrix(num_classes=self.class_num).cpu()
 
-        self.val_roc_auc       = MulticlassAUROC(num_classes=self.class_num)
-        self.val_f1            = MulticlassF1Score(num_classes=self.class_num)
-        self.val_precision     = MulticlassPrecision(num_classes=self.class_num)
-        self.val_recall        = MulticlassRecall(num_classes=self.class_num)
-        self.val_confmat       = MulticlassConfusionMatrix(num_classes=self.class_num)
+        self.val_epoch_preds = []
+        self.val_epoch_probs = []
+        self.val_epoch_labels = []
 
         # -------------------
         # TEST METRICS
         # -------------------
-        self.test_auc          = MulticlassAUROC(num_classes=self.class_num)
-        self.test_f1           = MulticlassF1Score(num_classes=self.class_num)
-        self.test_precision    = MulticlassPrecision(num_classes=self.class_num)
-        self.test_recall       = MulticlassRecall(num_classes=self.class_num)
-        self.test_confmat      = MulticlassConfusionMatrix(num_classes=self.class_num)
-        self.test_acc          = MeanMetric()
+        self.test_auc          = MulticlassAUROC(num_classes=self.class_num).cpu()
+        self.test_f1           = MulticlassF1Score(num_classes=self.class_num).cpu()
+        self.test_precision    = MulticlassPrecision(num_classes=self.class_num).cpu()
+        self.test_recall       = MulticlassRecall(num_classes=self.class_num).cpu()
+        self.test_confmat      = MulticlassConfusionMatrix(num_classes=self.class_num).cpu()
+        self.test_acc          = MeanMetric().cpu()
 
+        self.test_acc_per_class = None  
 
         self.opt_factory = LightningOptimizerFactory(
                 model=self.model,
                 parameters=parameters_dict,
                 model_type=method,
             )
-        self.to(self.device)
     #---
     # get optimizer
     #---
+    '''
     def configure_optimizers(self):
-      optimizer = self.optimizer_fn(self.model.parameters())
+      self.optimizer = self.optimizer_fn(self.model.parameters())
       if self.scheduler_fn is None:
           print('train, no set scheduler')
-          return optimizer
+          return self.optimizer
 
-      sched_ret = self.scheduler_fn(optimizer)
+      sched_ret = self.scheduler_fn(self.optimizer)
 
       if isinstance(sched_ret, dict):
           # pack optimizer + scheduler dict in Lightning format
           return {
-              "optimizer": optimizer,
+              "optimizer": self.optimizer,
               "lr_scheduler": sched_ret,
           }
 
@@ -173,6 +186,44 @@ class LightningSingleModel(pl.LightningModule):
       #fallback 
       print('no scheduler, returning optimizer in train')
       return optimizer
+    '''
+    def configure_optimizers(self):
+        self.optimizer = self.optimizer_fn(self.model.parameters())
+
+        if self.scheduler_fn is None:
+            print("train, no set scheduler")
+            self.scheduler = None
+            return self.optimizer
+
+        sched_ret = self.scheduler_fn(self.optimizer)
+
+        # Store the raw scheduler object for debug/step
+        if isinstance(sched_ret, dict) and "scheduler" in sched_ret:
+            self.scheduler = sched_ret["scheduler"]
+        elif hasattr(sched_ret, "step"):
+            self.scheduler = sched_ret
+        else:
+            self.scheduler = None
+
+        # Return in Lightning format
+        if isinstance(sched_ret, dict):
+            return {
+                "optimizer": self.optimizer,
+                "lr_scheduler": sched_ret,
+            }
+        if hasattr(sched_ret, "step"):
+            return {
+                "optimizer": self.optimizer,
+                "lr_scheduler": {
+                    "scheduler": sched_ret,
+                    "monitor": self.parameters_dict["control_metric"],
+                    "interval": "epoch",
+                },
+                "grad_clip_val": self.parameters_dict[f'{self.method}_model_parameters']['grad_clip'],
+                "gradient_clip_algorithm": self.parameters_dict[f'{self.method}_model_parameters']['gradient_clip_algorithm']
+            }
+
+        return self.optimizer
 
     #debug    
     def on_before_optimizer_step(self, optimizer):
@@ -191,13 +242,14 @@ class LightningSingleModel(pl.LightningModule):
         self.train_acc.reset()
         self.train_f1.reset()
 
-        if self.backbone_freeze_on_start and self.current_epoch <= (self.unfreeze_timer*self.backbone_num_groups+1):         
-          if self.current_epoch % self.unfreeze_timer == 0 and self.current_epoch != 0:
-            self.opt_factory.gradual_unfreeze(
-                epoch=self.current_epoch,
-                unfreeze_every_n_epochs=self.unfreeze_timer
-            )
-            self._sync_optimizer_new_params()
+        # Gradual unfreeze
+        if self.backbone_freeze_on_start and self.current_epoch == self.unfreeze_timer: 
+            new_params = self.opt_factory.unfreeze_backbone()
+            if new_params:
+                opt = self.trainer.optimizers[0]
+                self.opt_factory.sync_unfrozen_params_to_optimizer(opt, new_params)
+
+
     #reset key metrics on epoch to be safe
     def on_validation_epoch_start(self):
         # reset validation metrics to ensure per-epoch accumulation
@@ -207,10 +259,13 @@ class LightningSingleModel(pl.LightningModule):
             self.val_mimic_loss.reset()
             self.val_precision.reset()
             self.val_recall.reset()
-            self.val_confmat.reset()   
             self.val_roc_auc.reset()
             self.val_f1.reset()
             self.val_confmat.reset()
+            self.val_epoch_preds.clear()
+            self.val_epoch_probs.clear()
+            self.val_epoch_labels.clear()
+            self.val_acc.reset()
 
         except Exception:
             pass
@@ -236,12 +291,15 @@ class LightningSingleModel(pl.LightningModule):
     # --------------------------------
     # shared step (train + val)
     # --------------------------------
-    
+    @torch._dynamo.disable
     def _shared_step(self, batch, batch_idx, phase, return_preds: bool = False):
         is_train = phase == "train"
+        if batch_idx == 0 and self.current_epoch == 0:
+            print("BATCH INPUT SHAPE:", batch[0].shape)
 
         # unpack
-        if len(batch) == 3:
+        #if len(batch) == 3:
+        if self.mask_enabled:
             inputs, masks, labels = batch
         else:
             inputs, labels = batch
@@ -249,32 +307,26 @@ class LightningSingleModel(pl.LightningModule):
 
         inputs = inputs.to(self.device)
         labels = labels.to(self.device)
-        if masks is not None:
+        if self.mask_enabled:
             masks = masks.to(self.device)
 
         # ensure label dtype for classification
         labels = labels.long()
 
-        # DEBUG only first few
+        # DEBUG first data points to see normalization
         if self.debug_first and self.current_epoch == 0 and batch_idx < 5 and is_train:
-            print(f"[DEBUG] Input Stats: Min={inputs.min():.4f}, Max={inputs.max():.4f}, Mean={inputs.mean():.4f}, Std={inputs.std():.4f}")
-            if masks is not None:
-                print(f"[DEBUG] Mask Stats: Min={masks.min():.4f}, Max={masks.max():.4f}, Mean={masks.mean():.4f}")
+            print_debug_data(inputs = inputs, masks = masks if masks is not None else None)
 
-        # aux loss weight scheduling, drops off towards epoch
-        if self.parameters_dict['use_simple_aux_loss_scheduling']:
-            aux_w = max(0.0, 1 - self.current_epoch / self.parameters_dict["aux_loss_weight_epoch_limit"])
+       # aux loss weight scheduling, drops off towards epoch
+        if self.use_aux_loss_sched:
+            aux_w = max(0.0, 1 - self.current_epoch / self.aux_loss_limit)
         else:
             aux_w = 1.0
 
-
         # If caller asked for predictions (validation), run forward under no_grad to be explicit/safe
         # forward step
-        if return_preds and not is_train:
-            with torch.no_grad():
-                outputs, aux, mask_output = self(inputs, masks)
-        else:
-            outputs, aux, mask_output = self(inputs, masks)
+        outputs, aux, mask_output = self(inputs, masks)
+
         recon_feats = aux.get("recon_feats", []) if aux is not None else []
         proj_pairs = aux.get("proj_pairs", None) if aux is not None else None
 
@@ -283,13 +335,12 @@ class LightningSingleModel(pl.LightningModule):
         #----
 
         # classification loss (label smoothing only during training)
-        if self.label_smoother is not None and is_train:
+        if self.label_smoother:
             smoothed = self.label_smoother(outputs, labels)
-            clf_loss = self.criterion_clf(outputs, smoothed)
-        else:
-            # during validation we compute plain classification loss for logging (no gradient if no_grad)
-            clf_loss = self.criterion_clf(outputs, labels)
+        clf_loss = self.criterion_clf(outputs, smoothed) if is_train else self.criterion_clf(outputs, labels)
+
         
+
 
         batch_loss = clf_loss
         # ---------------------------------------
@@ -306,38 +357,28 @@ class LightningSingleModel(pl.LightningModule):
         if self.attn_reg_enabled:
             attn_sparsity_loss = compute_attn_sparsity_loss(aux, self.lambda_attn_sparsity, self.device)
             attn_consistency_loss = compute_attn_consistency_loss(aux, self.lambda_attn_consistency, self.device)
-            batch_loss+= attn_sparsity_loss * self.lambda_attn_sparsity + attn_consistency_loss* self.lambda_attn_consistency
+            batch_loss+= attn_sparsity_loss * self.lambda_attn_sparsity + attn_consistency_loss* self.lambda_attn_consistency if is_train else 0.0
         if self.feat_norm_reg_enabled:
             feat_norm_loss = compute_feat_norm_loss(aux, self.lambda_feat_norm, self.device)
-            batch_loss+= feat_norm_loss * self.lambda_feat_norm
+            batch_loss+= feat_norm_loss * self.lambda_feat_norm if is_train else 0.0
 
 
         # ----------------------
         # Mask loss
         # ----------------
         mask_out_resized = None
-        if self.mask_enabled and mask_output is not None and masks is not None:
+        if self.mask_enabled: #and mask_output is not None and masks is not None:
             if mask_output.shape[-2:] != masks.shape[-2:]:
-                print('warning, mask rezised')
+                #print('warning, mask rezised')
                 mask_out_resized = F.interpolate(mask_output,
                                                  size=masks.shape[-2:],
                                                  mode="bilinear",
                                                  align_corners=False)
             else:
                 mask_out_resized = mask_output
-            #only dice supported for now
-            # convert to one hot
-            mask_probs = torch.sigmoid(mask_output)       # probabilities
-            mask_pred_onehot = torch.cat([1 - mask_probs, mask_probs], dim=1)  # (N, 2, H, W)
-            mask_target_onehot = torch.cat([1 - masks, masks], dim=1)
-            mask_loss = 1.0 - self.mask_criterion(mask_pred_onehot, mask_target_onehot)
 
-
-            if is_train:
-                batch_loss += self.lambda_mask * mask_loss
-                self.train_mask_loss.update(mask_loss)
-            else:
-                self.val_mask_loss.update(mask_loss)
+            mask_loss = update_mask_metric(self,mask_output, masks)
+            batch_loss += self.lambda_mask * mask_loss if is_train else 0.0
                     
 
         # ----------------
@@ -353,13 +394,12 @@ class LightningSingleModel(pl.LightningModule):
               self.train_recon_loss.update(recon_loss_val.detach())
               self.train_mimic_loss.update(mimic_loss_val.detach())
               batch_loss += (
-                  self.lambda_recon * recon_loss_val * aux_w +
+                  self.lambda_recon * recon_loss_val * aux_w  + 
                   self.lambda_mimic * mimic_loss_val * aux_w
-              )
+              )  if is_train else 0.0
           else:
               self.val_recon_loss.update(recon_loss_val.detach())
               self.val_mimic_loss.update(mimic_loss_val.detach())
-              
 
 
         # -------------------
@@ -371,24 +411,13 @@ class LightningSingleModel(pl.LightningModule):
         # -------------------
         # Update metrics
         # -------------------
-        self.update_metrics(preds, outputs, labels, phase=phase)
+        if is_train or phase == 'val':
+          update_metrics(self,preds, outputs, labels, mask_loss, recon_loss_val, mimic_loss_val, phase=phase)
 
-        # -------------------
-        # Log aggregated metrics (MeanMetric objects)
-        # -------------------
-        if is_train:
-            self.log(f"train_loss", batch_loss, prog_bar=True, on_step=False, on_epoch=True)
-            self.log(f"train_acc", batch_acc, prog_bar=True, on_step=False, on_epoch=True)
-            self.log("train_mask_loss", self.train_mask_loss.compute(),  on_step=False, on_epoch=True, prog_bar=True)
-            self.log("train_recon_loss", self.train_recon_loss,  on_step=False, on_epoch=True, prog_bar=True)
-            self.log("train_mimic_loss", self.train_mimic_loss,  on_step=False, on_epoch=True, prog_bar=True)
-        else:
-            self.log(f"val_loss", batch_loss, prog_bar=True, on_step=False, on_epoch=True)
-            self.log(f"val_acc", batch_acc, prog_bar=True, on_step=False, on_epoch=True)
-            self.log("val_mask_loss", self.val_mask_loss.compute(), on_step=False, on_epoch=True, prog_bar=True)
-            self.log("val_recon_loss", self.val_recon_loss, on_step=False, on_epoch=True, prog_bar=True)
-            self.log("val_mimic_loss", self.val_mimic_loss, on_step=False, on_epoch=True, prog_bar=True)
-
+          # -------------------
+          # Log aggregated metrics (MeanMetric objects)
+          # -------------------
+          log_losses(self, batch_loss, batch_acc, phase=phase)
         # -------------------
         # Optional: return detached outputs
         # -------------------
@@ -458,6 +487,7 @@ class LightningSingleModel(pl.LightningModule):
     # ----
     # Dropout (only during training)
     # ---
+    @torch._dynamo.disable
     def enable_dropout(self, model: torch.nn.Module):
       for m in model.modules():
           if isinstance(m, torch.nn.Dropout):
@@ -468,6 +498,7 @@ class LightningSingleModel(pl.LightningModule):
     # MC dropout
     # ---
     #helper for setting batchnorm to eval
+    @torch._dynamo.disable
     def set_batchnorm_eval(self,model: torch.nn.Module):
         for m in model.modules():
             if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d,
@@ -480,6 +511,7 @@ class LightningSingleModel(pl.LightningModule):
             states[m] = m.training
         return states
 
+    @torch._dynamo.disable
     def _restore_module_train_states(self, model: torch.nn.Module, states):
         for m, was_training in states.items():
             try:
@@ -490,109 +522,165 @@ class LightningSingleModel(pl.LightningModule):
     def mc_enable(self, model: torch.nn.Module):
         self.enable_dropout(model)
         self.set_batchnorm_eval(model)
-    # MC dropout prediction
-  
-    def predict_mc_dropout(self, model, x, passes=20):
-      # save original training/eval states
-      orig_states = self._get_module_train_states(model)
-      # enable mc
-      self.mc_enable(model)
-      preds = []
-      with torch.no_grad():
-          for _ in range(passes):
-              logits = model(x)[0]
-              probs = torch.softmax(logits, dim=1)
-              preds.append(probs)
-      preds = torch.stack(preds, dim=0)
-      # restore modes
-      self._restore_module_train_states(model, orig_states)
-      return preds.mean(0), preds.std(0)
-      
- 
 
-    # ----
-    # TTA
-    #---- 
+    # ---- MC dropout prediction ----
+    @torch._dynamo.disable
+    def predict_mc_dropout(self, model, x, masks=None, passes=20, return_aux=False):
+        orig_states = self._get_module_train_states(model)
+        self.mc_enable(model)
 
-    
-    #todo could be made to share function with tta_mc
-    def predict_tta(self, model, x, masks, transforms=None):
+        preds = []
+        aux_list = []
+        with torch.no_grad():
+            for _ in range(passes):
+                if masks is not None:
+                    logits, aux, _ = model(x, masks)
+                else:
+                    logits, aux, _ = model(x)
+                probs = torch.softmax(logits, dim=1)
+                preds.append(probs)
+                if return_aux:
+                    aux_list.append(aux)
+
+        preds = torch.stack(preds, dim=0)
+        mean_probs = preds.mean(0)
+        std_probs = preds.std(0)
+
+        self._restore_module_train_states(model, orig_states)
+
+        if return_aux:
+            # Return last aux dict (could also return mean over aux)
+            return mean_probs, std_probs, aux_list[-1]
+        return mean_probs, std_probs
+
+
+    # ---- TTA prediction ----
+    @torch._dynamo.disable
+    def predict_tta(self, model, x, masks=None, transforms=None, return_aux=False):
         if transforms is None:
             transforms = self.transforms_list
+
         preds = []
+        aux_list = []
+
         with torch.no_grad():
             for t in transforms:
                 xt = t(x=x)
-                logits = model(xt, masks)[0]
+                if masks is not None:
+                    logits, aux, _ = model(xt, masks)
+                else:
+                    logits, aux, _ = model(xt)
                 probs = torch.softmax(logits, dim=1)
                 preds.append(probs)
+                if return_aux:
+                    aux_list.append(aux)
 
         preds = torch.stack(preds, dim=0)
-        return preds.mean(0)
+        mean_probs = preds.mean(0)
 
-    # ----
-    # both tta and mc
-    # ---
-    def predict_tta_mc(self, model, x, masks,  transforms=None, passes=10):
-        # save original training/eval states
+        if return_aux:
+            return mean_probs,preds.std(0), aux_list[-1]
+        return mean_probs, preds.std(0)
+
+
+    # ---- TTA + MC dropout ----
+    @torch._dynamo.disable
+    def predict_tta_mc(self, model, x, masks=None, transforms=None, passes=10, return_aux=False):
         orig_states = self._get_module_train_states(model)
-
+        self.mc_enable(model)
         if transforms is None:
             transforms = self.transforms_list
 
         preds = []
-        self.mc_enable(model)
+        aux_last = None
 
         with torch.no_grad():
             for t in transforms:
-                xt = t(x=x)                      
+                xt = t(x=x)
                 for _ in range(passes):
-                    logits = model(xt, masks)[0]
+                    if masks is not None:
+                        logits, aux, _ = model(xt, masks)
+                    else:
+                        logits, aux, _ = model(xt)
                     probs = torch.softmax(logits, dim=1)
                     preds.append(probs)
-        # restore modes
-        self._restore_module_train_states(model, orig_states)
+                    if return_aux:
+                        aux_last = aux
+
         preds = torch.stack(preds, dim=0)
-        return preds.mean(0), preds.std(0)
+        mean_probs = preds.mean(0)
+        std_probs = preds.std(0)
+
+        self._restore_module_train_states(model, orig_states)
+
+        if return_aux:
+            return mean_probs, std_probs, aux_last
+        return mean_probs, std_probs
+
       
+
     #---
     # calls the chosen test mode
-    #--  
-    def predict_custom(self, batch, mode="normal", mc_passes=10):
-      inputs = batch[0]
-      labels = batch[-1]
-      masks = batch[1] if len(batch) == 3 else None
+    #--
 
-      if mode == "normal":
-          with torch.no_grad():
-              outputs, aux, mask_out = self.model(inputs, masks)
-          return outputs
+    def predict_custom(self, batch, mode="normal", mc_passes=10, return_aux=False):
+        inputs = batch[0]
+        labels = batch[-1]
+        masks = batch[1] if len(batch) == 3 else None
 
-      elif mode == "tta":
-          return self.predict_tta(self.model, inputs, masks)
+        if mode == "normal":
+            outputs, aux, mask_out = self.model(inputs, masks)
 
-      elif mode == "mc":
-          return self.predict_mc_dropout(self.model, inputs, passes=mc_passes)
+            if return_aux:
+                aux = detach_aux(aux)
+                return outputs, aux
+            return outputs
 
-      elif mode == "tta_mc":
-          return self.predict_tta_mc(self.model, inputs, masks, passes=mc_passes)
+        elif mode == "tta":
+            return self.predict_tta(self.model, inputs, masks, return_aux=return_aux)
 
-      else:
-          raise ValueError(f"Unknown predict mode: {mode}")
+        elif mode == "mc":
+            return self.predict_mc_dropout(self.model, inputs, masks, passes=mc_passes, return_aux=return_aux)
+
+        elif mode == "tta_mc":
+            return self.predict_tta_mc(self.model, inputs, masks, passes=mc_passes, return_aux=return_aux)
+
+        else:
+            raise ValueError(f"Unknown predict mode: {mode}")
+
     # -----------------
     # Lightning training_step
     # -----------------
     def training_step(self, batch, batch_idx):
         return self._shared_step(batch, batch_idx, "train")
 
+    @torch._dynamo.disable
+    def on_train_epoch_end(self):
+        self.log("train_f1", self.train_f1.compute(), prog_bar=True)
+        self.log("train_mask_loss", self.train_mask_loss.compute())
+        self.log("train_recon_loss", self.train_recon_loss.compute())
+        self.log("train_mimic_loss", self.train_mimic_loss.compute())
+
+        self.train_f1.reset()
+        self.train_mask_loss.reset()
+        self.train_recon_loss.reset()
+        self.train_mimic_loss.reset()
+
 
     # ------
     # Lightning validation_step
     # -------
-
     def validation_step(self, batch, batch_idx):      
         loss, outputs, aux, mask_output = self._shared_step(batch, batch_idx, "val", return_preds=True)
-        
+        aux = detach_aux(aux)
+        probs = torch.softmax(outputs, dim=1)
+        preds = probs.argmax(dim=1)
+
+        self.val_epoch_probs.append(probs.detach().cpu())
+        self.val_epoch_preds.append(preds.detach().cpu())
+        self.val_epoch_labels.append(batch[-1].detach().cpu())
+
+
         if self.parameters_dict['debug_val'] and (self.enable_modality_attention or self.mask_enabled) and batch_idx == 0: 
           # Only store FIRST batch of validation
           self.latest_val_sample = {
@@ -602,174 +690,241 @@ class LightningSingleModel(pl.LightningModule):
               "mod_attn": aux["mod_attn_map"].detach().cpu() if self.enable_modality_attention else None,
           }
               
-      
         return loss
-    
-          
-    def on_validation_epoch_end(self):
-        val_acc = float(self.trainer.callback_metrics["val_acc"])
-
-        #compute & update  & reset val_auc_roc
-        val_roc_auc = self.val_roc_auc.compute()
-        self.log("val_roc_auc", val_roc_auc, prog_bar=True)
-        self.val_roc_auc.reset()
         
+    @torch._dynamo.disable
+    def on_validation_epoch_end(self):
+        if len(self.val_epoch_labels) == 0:
+            return
+
+        probs = torch.cat(self.val_epoch_probs, dim=0).cpu()
+        preds = torch.cat(self.val_epoch_preds, dim=0).cpu()
+        labels = torch.cat(self.val_epoch_labels, dim=0).cpu()
+
+        self.val_roc_auc.cpu()
+        self.val_confmat.cpu()
+        self.val_f1.cpu()
+
+        self.val_roc_auc.update(probs, labels.to(dtype=torch.long))
+        self.val_confmat.update(preds, labels)
+        self.val_f1.update(preds, labels)
+
+
+        self.log("val_roc_auc", self.val_roc_auc.compute(), prog_bar=True)
+        self.log("val_f1", self.val_f1.compute(), prog_bar=True)
+        self.log("val_mask_loss", self.val_mask_loss.compute())
+        self.log("val_recon_loss", self.val_recon_loss.compute())
+        self.log("val_mimic_loss", self.val_mimic_loss.compute())
         # nothing to compare yet
         if self.latest_val_sample is None:
             return
+        # --------------------
+        # Visualize masks
+        # --------------------
+        if self.mask_enabled:
+            # Optional visualization
+            if self.parameters_dict["debug_val"] and self.current_epoch % VIZ_FREQUENCY == 0:
+                visualize_single_mask_triplet(
+                    input_img=self.latest_val_sample["input"],
+                    gt_mask=self.latest_val_sample["gt_mask"],
+                    pred_mask=self.latest_val_sample["pred_mask"],
+                    title_prefix=f"Epoch {self.current_epoch}, sample:",
+                )
+            
+        self.val_roc_auc.reset()
+        self.val_confmat.reset()
+        self.val_f1.reset()
+        self.val_mask_loss.reset()
+        self.val_recon_loss.reset()
+        self.val_mimic_loss.reset()
+        self.val_epoch_probs.clear()
+        self.val_epoch_preds.clear()
+        self.val_epoch_labels.clear()
+        return super().on_validation_epoch_end()
+            
+    def on_test_epoch_start(self):
+        torch.cuda.empty_cache()
+        self.test_f1.cpu() 
+        self.test_precision.cpu()
+        self.test_recall.cpu()
+        self.test_confmat.cpu()
+        
 
-        if val_acc > self.best_val_acc:
-            self.best_val_acc = val_acc
-
-            best = self.latest_val_sample
-            save_dir = self.paths[self.parameters_dict["save_dir"]]
-
-            # --------------------
-            # Save masks
-            # --------------------
-            if self.mask_enabled:
-                torch.save(best["pred_mask"], f"{save_dir}/best_pred_mask.pt")
-                torch.save(best["input"],     f"{save_dir}/best_input.pt")
-
-                if best["gt_mask"] is not None:
-                    torch.save(best["gt_mask"], f"{save_dir}/best_gt_mask.pt")
-
-                # Optional visualization
-                if self.parameters_dict["debug_val"]:
-                    visualize_single_mask_triplet(
-                        input_img=best["input"],
-                        gt_mask=best["gt_mask"],
-                        pred_mask=best["pred_mask"],
-                        title_prefix=f"Epoch {self.current_epoch}, best-so-far sample:",
-                    )
-
-            # --------------------
-            # Save modality attention
-            # --------------------
-            if self.enable_modality_attention:
-                mod = best.get("mod_attn")
-                mod_cpu = mod.detach().to(torch.float32).cpu()
-
-                # only get first sample will be same
-                vec = mod_cpu[0].view(-1).tolist()
-                if mod is not None:
-                    torch.save(vec, f"{save_dir}/best_modality_attention.pt")
-
-
-                if self.parameters_dict.get("debug_val", False):
-                    vec = mod_cpu.mean(dim=0).view(-1).tolist()
-                    self.print(f"Modality vector (batch mean): {vec}")
-                    #self.print(f"Modality vector (sample 0): {vec}")
-    # -----
-    #  lightning test step
-    # ---------
-
+    @torch._dynamo.disable 
     def test_step(self, batch, batch_idx):
         mode = self.parameters_dict["test_mode"]
         mc_passes = self.parameters_dict["mc_passes"]
 
         # ---- prediction ----
-        pred_result = self.predict_custom(batch, mode=mode, mc_passes=mc_passes)
-        if isinstance(pred_result, torch.Tensor):
-            outputs = pred_result
-            variance = None
-        elif isinstance(pred_result, tuple):
-            outputs, variance = pred_result
-            # log MC/TTA uncertainty
-            self.log("test_uncertainty_mean", variance.mean(), prog_bar=False)
+        if mode == "normal":
+          outputs, aux = self.predict_custom(batch=batch, mode=mode, mc_passes=mc_passes,  return_aux=True)
         else:
-            raise RuntimeError("Unexpected predict_custom output.")
+          outputs, variance, aux = self.predict_custom(batch=batch, mode=mode, mc_passes=mc_passes, return_aux=True)
 
-        labels = batch[-1].long()
-        preds = outputs.argmax(dim=1)
+        aux = detach_aux(aux)
 
-        # ---- update test metrics ----
-        self.test_acc.update((preds == labels).float().mean())
-        self.test_auc.update(outputs, labels)
-        self.test_f1.update(outputs, labels)
-        self.test_precision.update(outputs, labels)
-        self.test_recall.update(outputs, labels)
+        # log MC/TTA uncertainty
+        if mode in ['mc', 'tta', 'tta_mc']:
+            self.log("test_uncertainty_mean", variance.mean(), prog_bar=False)
+
+        labels = batch[-1].long().cpu()
+        probs = torch.softmax(outputs, dim=1).cpu()   
+        preds = probs.argmax(dim=1).cpu()
+
+        # --- store raw probs for ROC ---
+        self.test_preds.append(probs.detach().cpu())
+        self.test_targets.append(labels.detach().cpu())
+
+        # --- modality attention: take mean over batch ---
+        if self.enable_modality_attention:
+            mod = aux["mod_attn_map"]
+            if mod is not None:
+                # mod shape: (B, num_modalities) 
+                # take mean over batch dimension
+                mean_mod = mod.detach().cpu().mean(dim=0)  # shape: (num_modalities,)
+                if not hasattr(self, "test_mod_attn"):
+                    self.test_mod_attn = []
+                self.test_mod_attn.append(mean_mod.float())
+
+        batch_acc = (preds == labels).float().mean()
+
+        # ---- update metrics  ----
+        self.test_acc.update(batch_acc)  
+        self.test_auc.update(probs, labels)
+        self.test_f1.update(preds, labels)
+        self.test_precision.update(preds, labels)
+        self.test_recall.update(preds, labels)
         self.test_confmat.update(preds, labels)
-
-        # ---- log aggregated metrics ----
-        self.log("test_acc", self.test_acc, prog_bar=True, on_epoch=True)
-        self.log("test_auc", self.test_auc, prog_bar=True, on_epoch=True)
-        self.log("test_f1", self.test_f1, prog_bar=True, on_epoch=True)
-        self.log("test_precision", self.test_precision, prog_bar=True, on_epoch=True)
-        self.log("test_recall", self.test_recall, prog_bar=True, on_epoch=True)
-
+        
         return preds
 
-    #update to train previously frozen
-    def _sync_optimizer_new_params(self):
-        try:
-            if not hasattr(self, "trainer") or not getattr(self, "trainer", None):
-                return
-            if not self.trainer.optimizers:
-                return
-            opt = self.trainer.optimizers[0]
-        except Exception:
-            return
+    def on_test_epoch_end(self):
+        # compute main metrics
+        self.log("test_acc", self.test_acc.compute())
+        self.log("test_auc", self.test_auc.compute())
+        self.log("test_f1", self.test_f1.compute())
+        self.log("test_precision", self.test_precision.compute())
+        self.log("test_recall", self.test_recall.compute())
 
-        existing_ids = {id(p) for g in opt.param_groups for p in g["params"]}
-        to_add = [p for p in self.model.parameters() if p.requires_grad and id(p) not in existing_ids]
-        if not to_add:
-            return
-
-        base_lr = self.parameters_dict["backbone_unfreeze_lr"]
-        factor = self.parameters_dict["backbone_unfreeze_lr_factor"]
-
-        # clean, safe LR schedule
-        backbone_lr = base_lr * (factor ** self.layers_unfrozen)
-
-        self.layers_unfrozen += 1
-
-        base_wd = opt.param_groups[0].get("weight_decay", 0.0)
-        opt.add_param_group({"params": to_add, "lr": backbone_lr, "weight_decay": base_wd})
-
-        print(f"[INFO] Added {len(to_add)} newly-unfrozen params with lr={backbone_lr:.6g} (group={self.layers_unfrozen-1})")
-
-    # ---
-    # measure grad norm, pre clip
-    # ---
-    def on_after_backward(self):
-        total_norm = torch.norm(
-            torch.stack([p.grad.data.norm(2) for p in self.parameters() if p.grad is not None]), 2
-        )
-        self.log("grad_norm", total_norm, prog_bar=True)
-
-    # -------------------
-    # Helper: Update metrics
-    # -------------------
+        # compute confusion matrix and per-class accuracy
+        confmat = self.test_confmat.compute()  # shape: [num_classes, num_classes]
+        per_class_acc = confmat.diag() / confmat.sum(1).clamp(min=1)  # avoid div by 0
 
 
-    @torch._dynamo.disable
-    def update_metrics(self, preds, logits, labels, phase="train"):
-        """
-        Update all metrics for a given phase.
-        Args:
-            preds:  model predictions
-            labels: ground truth class indices (same spatial shape as logits)
-            phase: "train" | "val" | "test"
-        """
-        labels = labels.long()
+        for i, acc in enumerate(per_class_acc):
+            self.log(f"test_acc_class_{i}", acc, prog_bar=True)
+        self.test_acc_per_class = per_class_acc.cpu().numpy() 
+
+        # reset metrics
+        self.test_acc.reset()
+        self.test_auc.reset()
+        self.test_f1.reset()
+        self.test_precision.reset()
+        self.test_recall.reset()
+        self.test_confmat.reset()
+
         
-        if phase == "train":
-            self.train_f1.update(preds, labels)
-        elif phase == "val":
-                  
-            # Compute softmax probabilities for AUROC
-            probs = torch.softmax(logits, dim=1)  # shape (B, C, H, W) or (B, C, D, H, W)
-            self.val_f1.update(preds, labels)
-            self.val_roc_auc.update(probs, labels)
-            self.val_confmat.update(preds, labels)
-        elif phase == "test":                  
-            # Compute softmax probabilities for AUROC
-            probs = torch.softmax(logits, dim=1)  # shape (B, C, H, W) or (B, C, D, H, W)
-            self.test_f1.update(preds, labels)
-            self.test_auc.update(probs, labels)
-        else:
-            raise ValueError(f"Unknown phase {phase}")
+        # concatenate stored preds + labels
+        self.test_preds_array.append(torch.cat(self.test_preds, dim=0).numpy())
+        self.test_targets_array.append(torch.cat(self.test_targets, dim=0).numpy())
+
+
+
+        # modality attention
+        if self.enable_modality_attention and self.test_mod_attn:
+            # stack per-batch mean vectors
+            self.test_mod_attn = torch.stack(self.test_mod_attn, dim=0)  # shape: [num_batches, num_modalities]
+            
+        # clean up
+        self.test_preds.clear()
+        self.test_targets.clear()
+
+
+    def on_after_backward(self):
+        if self.global_step % 100 == 0:
+            # ---- total grad norm ----
+            total_norm = torch.norm(
+                torch.stack([p.grad.detach().norm(2) for p in self.parameters() if p.grad is not None]), 2
+            )
+
+            # ---- backbone grad norm ----
+            backbone_params = list(self.model.model.backbone.parameters()) if self.use_backbone else []
+            backbone_grads = [p.grad for p in backbone_params if p.grad is not None]
+
+            if backbone_grads:
+                backbone_norm = torch.norm(torch.stack([g.detach().norm(2) for g in backbone_grads]), 2)
+            else:
+                backbone_norm = torch.tensor(0.0, device=total_norm.device)
+
+            # ---- check if backbone params are in optimizer and get LR ----
+            #if self.debug_scheduler:
+            if self.debug_anomaly:
+              backbone_in_opt = []
+              backbone_lrs = set()
+
+              for group in self.optimizer.param_groups:
+                  group_params = set(group['params'])
+                  for p in backbone_params:
+                      if p in group_params:
+                          backbone_in_opt.append(True)
+                          backbone_lrs.add(group['lr'])
+                      else:
+                          backbone_in_opt.append(False)
+              # ---- summarize ----
+              percent_in_opt = 100.0 * sum(backbone_in_opt) / len(backbone_in_opt)
+              lr_list = sorted(list(backbone_lrs))
+              print(f"[Backbone] Any params in optimizer? {percent_in_opt}, LRs: {lr_list}")
+            
+            # ---- log ----
+            self.log("grad_norm", total_norm, prog_bar=True)
+            self.log("backbone_grad_norm", backbone_norm, prog_bar=True)
+#--- 
+# Deatach aux helper
+# ---
+def detach_aux(aux):
+    if aux is None:
+        return None
+    return {k: (v.detach() if torch.is_tensor(v) else v)
+            for k, v in aux.items()}
+# -------------------
+# Helper: Update metrics
+# -------------------
+
+
+@torch._dynamo.disable
+def update_metrics(self, preds, logits, labels, mask_loss_val, recon_loss_val, mimic_loss_val, phase="train"):
+    """
+    Update all metrics for a given phase.
+    Args:
+        preds:  model predictions
+        labels: ground truth class indices (same spatial shape as logits)
+        phase: "train" | "val" | "test"
+    """
+    labels = labels.long()
+    if phase == "train":
+        self.train_f1.update(preds, labels)
+        self.train_recon_loss.update(recon_loss_val.detach())
+        self.train_mask_loss.update(mask_loss_val.detach())
+        self.train_mimic_loss.update(mimic_loss_val.detach())
+    elif phase == "val":
+              
+        # Compute softmax probabilities for AUROC
+        self.val_mask_loss.update(mask_loss_val.detach())
+        self.val_mimic_loss.update(mimic_loss_val.detach())
+        self.val_recon_loss.update(recon_loss_val.detach())
+  
+  
+    #not currently used fix if I want to use it
+    elif phase == "test":                  
+        # Compute softmax probabilities for AUROC
+        probs = torch.softmax(logits, dim=1)  # shape (B, C, H, W) or (B, C, D, H, W)
+        self.test_f1.update(preds, labels)
+        self.test_auc.update(probs, labels)
+        
+    else:
+        raise ValueError(f"Unknown phase {phase}")
+
+    
 
 
 # -------
@@ -842,7 +997,8 @@ def visualize_single_mask_triplet(input_img, gt_mask, pred_mask, title_prefix=""
 
 
     plt.subplot(1, 4, 4)
-    plt.imshow(pred_bin, cmap="Grays_r") #invert color scale 
+    #plt.imshow(pred_bin, cmap="Grays_r") #invert color scale 
+    plt.imshow(pred_bin, cmap="gray")  
     plt.title("Pred Bin")
     plt.axis("off")
 
@@ -892,10 +1048,12 @@ def compute_feat_norm_loss(aux, lambda_feat_norm, device):
     return loss
 
 
-def mimic_feat_loss(s_feat: torch.Tensor, t_feat: torch.Tensor) -> torch.Tensor:
+def mimic_feat_loss(s_feat, t_feat, eps=1e-6):
+    t_feat = t_feat.detach()  # detach teacher/fused
     s = F.normalize(s_feat.flatten(1), dim=1)
     t = F.normalize(t_feat.flatten(1), dim=1)
-    return 1.0 - (s * t).sum(dim=1).mean()
+    cos = (s * t).sum(dim=1)
+    return (1.0 - cos.clamp(-1+eps, 1-eps)).mean()
 
 #charbonnier recon loss
 def charbonnier_loss(pred, target, eps=1e-3):
@@ -906,3 +1064,34 @@ def recon_image_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     target = target.clamp(0,1)
     loss = charbonnier_loss(pred, target)
     return loss
+
+
+    
+@torch._dynamo.disable
+def update_mask_metric(self, preds, masks):
+  return self.mask_criterion(preds, masks)
+# -------------------
+# Log aggregated metrics (MeanMetric objects)
+# -------------------
+@torch._dynamo.disable
+def log_losses(self, batch_loss, batch_acc, phase):    
+  if phase=='train':
+      self.log(f"train_loss", batch_loss, prog_bar=True, on_step=False, on_epoch=True)
+      self.log(f"train_acc", batch_acc, prog_bar=True, on_step=False, on_epoch=True)
+
+  elif phase == 'val':
+      self.log(f"val_loss", batch_loss, prog_bar=True, on_step=False, on_epoch=True)
+      self.log(f"val_acc", batch_acc, prog_bar=True, on_step=False, on_epoch=True)
+      self.log("val_mask_loss", self.val_mask_loss, on_step=False, on_epoch=True, prog_bar=True)
+      self.log("val_recon_loss", self.val_recon_loss, on_step=False, on_epoch=True, prog_bar=True)
+      self.log("val_mimic_loss", self.val_mimic_loss, on_step=False, on_epoch=True, prog_bar=True)
+
+#---
+# Debug for data, shows if input is normalized
+#--
+@torch._dynamo.disable
+def print_debug_data(inputs, masks):
+    print(f"[DEBUG] Input Stats: Min={inputs.min():.4f}, Max={inputs.max():.4f}, Mean={inputs.mean():.4f}, Std={inputs.std():.4f}")
+    if masks is not None:
+        print(f"[DEBUG] Mask Stats: Min={masks.min():.4f}, Max={masks.max():.4f}, Mean={masks.mean():.4f}")
+

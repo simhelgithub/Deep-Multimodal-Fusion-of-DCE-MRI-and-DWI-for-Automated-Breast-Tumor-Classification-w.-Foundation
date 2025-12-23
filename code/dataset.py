@@ -71,7 +71,8 @@ class SingleInputDataset(torch.utils.data.Dataset):
         img = self.imgs[index].clone()  # (C,H,W)
         label = self.labels[index] if self.labels is not None else None
         mask = self.masks[index] if self.masks is not None else None
-
+        if index == 0:
+            print("DATASET SAMPLE SHAPE:", img.shape)
         if self.transforms:
             img = self.transforms(img)
 

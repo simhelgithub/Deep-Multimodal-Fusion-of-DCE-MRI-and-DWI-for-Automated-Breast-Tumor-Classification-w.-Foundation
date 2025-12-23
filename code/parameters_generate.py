@@ -61,17 +61,28 @@ parameters["dwi_model_parameters"] = {
 
 
     # --- base model info
-    'input_size':128, #currently must be 128 for mask
+    'input_size': 256, #128, #currently must be 128 for mask
 
+    #--- tranfromer model 
+    'use_hybrid_transformer': True, #selects to use hybrid dce/dwi transformer
+    'transformer_heads': 4,
+    'transformer_patch_size': 2, 
+    'transformer_depth': 6,
+    'transformer_embed_dim': 512, #must be same as mid channels
     # ---
     'dropout': 0.4,
 
-    # ---- model structure ----
+    # ---- model structure (block1->block2->block3) ----
     #"channels": (32, 64, 128), #underfit
     #"channels": (64, 128, 256), #underfit
     "channels": (128, 256, 512),
-    'repeat_blocks': (2,3,1), #repeat block count on different depths, block1,block2,block3 1 for off
-    'mid_squeeze': 4, #2 or 4 reasonable
+    'repeat_blocks': (1,1,1), #repeat block count on different depths, block1,block2,block3 1 for off
+    'downsample': (True, False, False),
+    'downsample_each_repeat':False,
+    'mid_squeeze': 2, #2 or 4 reasonable
+    #"backbone_stride": 8,
+    "backbone_index_lists": [], # set when creating the model automatically setup for each
+    "backbone_out_channels": (), # set when creating the model automatically setup for each
 
     "proj_dim": 64,
     "use_se": True,
@@ -81,7 +92,7 @@ parameters["dwi_model_parameters"] = {
     # ---- model features
     "enable_modality_attention": True,
     "use_backbone": True,
-    "backbone_str": 'resnet50d',
+    "backbone_str": 'resnet50d', #options resnet50d
     
     'grad_clip':5.0,
     # ---- label smoothing ----
@@ -107,25 +118,27 @@ parameters["dwi_model_parameters"] = {
     'mask_parameters' : {
       "mask": True,   #mask enabled for custom models
       "mask_stage": "f2", #"f2", #f1,f2,f3 avaialbe
-      "lambda_mask": 0.7, #0.4 stuck
-      "mask_loss_type": "dice",
+      "lambda_mask": 0.5, 
+      "mask_loss_type": "dice", #dice_bce or dice
       "mask_target_size": (32, 32),
-      "mask_fusion_attention": True
+      "mask_fusion_attention": True,
+      "dice_weight": 0.5, #dice_bce only
+      "bce_weight": 0.5 #dice_bce only
     },
     # --- optimizer parameters
     'optimizer_parameters' : {
       'name':"adamW", #or adam
-      "lr": 1e-4,
+      "lr": 4e-4,
       "betas":(0.9, 0.999),
       "eps":1e-08,
       "amsgrad":False,
+      "weight_decay": 1e-4, 
       "num_lr_groups": 3,
       "discriminative_lr": True,
-      "lr_decay_factor": 2,
-      "weight_decay": 0.001,
+      "lr_decay_factor": 1.2,
       "discrim_on": "all", #options: all, backbone, non_backbone
       "discriminative_reg": True,      
-      "reg_decay_factor": 2,     
+      "reg_decay_factor": 0.8,     
       "reg_base": 1e-4
     },
     'scheduler' : {
@@ -151,8 +164,6 @@ parameters["dwi_model_parameters"] = {
     "lambda_attn_consistency": 2e-4,
     "feat_norm_reg_enabled": True,
     "lambda_feat_norm": 2e-4,
-
-
 }      
 
 #just the same for now
@@ -204,10 +215,11 @@ parameters['mc_passes'] = 10
 #--
 parameters['backbone_freeze_on_start'] = True
 parameters['backbone_num_groups'] = 3 #how many parts to split the backbone in for gradual unfreezing
-parameters['unfreeze_timer'] = 30
-
-parameters['backbone_unfreeze_lr'] = parameters["dwi_model_parameters"]['optimizer_parameters']['lr'] * 0.05
-   
+parameters['unfreeze_timer'] = 20
+parameters['foundation_model_unfreeze_timer'] = 20
+parameters['backbone_unfreeze_lr'] = parameters["dwi_model_parameters"]['optimizer_parameters']['lr'] * 0.1
+parameters['backbone_unfreeze_wd'] = parameters["dwi_model_parameters"]['optimizer_parameters']['reg_base'] * 0.1
+parameters['foundation_model_unfreeze_lr'] = 1e-5
 parameters['backbone_unfreeze_lr_factor']=  0.25
 
 # Aux-Loss Scheduling
@@ -232,7 +244,7 @@ if parameters['dwi_add_adc_map']: parameters['dwi_channel_num']+=1
 parameters['dce_channel_num']= len(parameters['dce_channels_to_use'])
 
 #min epochs
-parameters['min_epochs'] =  max(parameters['patience']*3, parameters['num_epochs'])
+parameters['min_epochs'] =  parameters['patience']*3
 
 if parameters['backbone_freeze_on_start']:
   parameters['min_epochs'] = max(parameters['min_epochs'], parameters['unfreeze_timer']*(parameters['backbone_num_groups'] +1))
