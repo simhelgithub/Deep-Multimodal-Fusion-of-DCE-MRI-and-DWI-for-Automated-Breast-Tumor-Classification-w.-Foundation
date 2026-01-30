@@ -27,7 +27,7 @@ parameters["debug_anomaly"] = False
 #parameters['num_epochs']=1500
 #parameters['finetune_num_epochs']=20
 #parameters['batch_size']=32
-parameters['num_epochs']= 800
+parameters['num_epochs']= 900
 #parameters['finetune_num_epochs']=20 #no longer needed
 parameters['batch_size']=32 
 #parameters['input_size']=32
@@ -39,11 +39,15 @@ parameters['namelist'] = ['train','val','test']
 
 
 
+
 #--
 # main control
 #--
-parameters['control_metric'] =  'val_roc_auc'
-parameters['patience'] = 75
+parameters['control_metric'] =  'val_loss'
+#parameters['control_metric'] =  'val_roc_auc'
+parameters['early_stop_metric'] = 'val_roc_auc'
+
+parameters['patience'] = 90
 
 #controlled elsewhere
 #parameters['version'] = 'experimental' #
@@ -64,13 +68,13 @@ parameters["dwi_model_parameters"] = {
     'input_size': 256, #128, #currently must be 128 for mask
 
     #--- tranfromer model 
-    'use_hybrid_transformer': True, #selects to use hybrid dce/dwi transformer
+    'use_hybrid_transformer': False, #selects to use hybrid dce/dwi transformer
     'transformer_heads': 4,
     'transformer_patch_size': 2, 
     'transformer_depth': 6,
     'transformer_embed_dim': 512, #must be same as mid channels
     # ---
-    'dropout': 0.4,
+    'dropout': 0.2,
 
     # ---- model structure (block1->block2->block3) ----
     #"channels": (32, 64, 128), #underfit
@@ -83,42 +87,42 @@ parameters["dwi_model_parameters"] = {
     #"backbone_stride": 8,
     "backbone_index_lists": [], # set when creating the model automatically setup for each
     "backbone_out_channels": (), # set when creating the model automatically setup for each
-
     "proj_dim": 64,
     "use_se": True,
-    'grad_clip': 5,
+    'grad_clip': 5.0,
     'gradient_clip_algorithm':'norm', #alt, "norm" "value"
   
     # ---- model features
     "enable_modality_attention": True,
     "use_backbone": True,
-    "backbone_str": 'resnet50d', #options resnet50d
-    
-    'grad_clip':5.0,
+    "use_input_adapt": False, #only for resnet and resnet50d
+    "use_advanced_adapt": False, #use a more complex backbone channel adpation
+    "transformer_backbone": False,
+    "backbone_str": 'radimagenet', #options resnet50d, resnet50, vit_base_patch16_224, dino_vitbase16_pretrain, radimagenet
     # ---- label smoothing ----
     "label_smoothing_enabled": True,
     "label_smoothing_alpha": 0.1,
 
     # ---- mimic loss ----
     "mimic_enabled": True,
-    "lambda_mimic": 0.4,
+    "lambda_mimic": 0.2,
 
     # ---- reconstruction loss ----
     "recon_enabled": True,
     "reconstruction_loss_code": "mse",  
-    "lambda_recon": 0.2,
+    "lambda_recon": 0.1,
 
     # ---- classification loss
     "classification_loss_parameters": {
       "classification_loss_code":"wfl",          # or 'fl'
-      "gamma": 2.0,
+      "gamma": 1.5,
       "alpha": None #will be calculated with wfl
     },
     # --- Mask parameters
     'mask_parameters' : {
-      "mask": True,   #mask enabled for custom models
+      "mask": True,   #mask enabled for custom models 
       "mask_stage": "f2", #"f2", #f1,f2,f3 avaialbe
-      "lambda_mask": 0.5, 
+      "lambda_mask": 0.2,  
       "mask_loss_type": "dice", #dice_bce or dice
       "mask_target_size": (32, 32),
       "mask_fusion_attention": True,
@@ -128,11 +132,11 @@ parameters["dwi_model_parameters"] = {
     # --- optimizer parameters
     'optimizer_parameters' : {
       'name':"adamW", #or adam
-      "lr": 4e-4,
+      "lr": 1e-4,
       "betas":(0.9, 0.999),
       "eps":1e-08,
       "amsgrad":False,
-      "weight_decay": 1e-4, 
+      "weight_decay": 4e-5, 
       "num_lr_groups": 3,
       "discriminative_lr": True,
       "lr_decay_factor": 1.2,
@@ -146,9 +150,9 @@ parameters["dwi_model_parameters"] = {
 
       #for reduce_lr_on_plateau
       'factor': 0.5,
-      'patience': int(parameters['patience']), 
-      'min_lr': 1e-7,
-      'threshold': 5e-4,
+      'patience': int(5+ parameters['patience']/3), 
+      'min_lr': 4e-7,
+      'threshold': 0.0001,
       'monitor': parameters['control_metric'],
 
       #for cosine & cosine_with_warmup
@@ -159,11 +163,11 @@ parameters["dwi_model_parameters"] = {
 
     },
     # regularization 
-    "attn_reg_enabled": True,
-    "lambda_attn_sparsity": 2e-4, #1e-4 overfitting
-    "lambda_attn_consistency": 2e-4,
+    "attn_reg_enabled": False,
+    "lambda_attn_energy": 1e-4, 
+    "lambda_feature_consistency": 1e-4,
     "feat_norm_reg_enabled": True,
-    "lambda_feat_norm": 2e-4,
+    "lambda_feat_norm": 4e-5,
 }      
 
 #just the same for now
@@ -193,11 +197,12 @@ parameters['fusion_model_parameters']['fusion_specific_parameters'] = {
 # Early stopping params
 #--
 parameters['early_stopping_parameters'] = {
-    'metric': parameters['control_metric'],
+    'metric': parameters['early_stop_metric'], #parameters['control_metric'],
     'mode': 'max',
     'patience': parameters['patience'], 
-    'min_delta': 0.001
+    'min_delta': 0.0001
 }
+
 
 
 #--
@@ -215,8 +220,8 @@ parameters['mc_passes'] = 10
 #--
 parameters['backbone_freeze_on_start'] = True
 parameters['backbone_num_groups'] = 3 #how many parts to split the backbone in for gradual unfreezing
-parameters['unfreeze_timer'] = 20
-parameters['foundation_model_unfreeze_timer'] = 20
+parameters['unfreeze_timer'] = 40
+parameters['foundation_model_unfreeze_timer'] = 40
 parameters['backbone_unfreeze_lr'] = parameters["dwi_model_parameters"]['optimizer_parameters']['lr'] * 0.1
 parameters['backbone_unfreeze_wd'] = parameters["dwi_model_parameters"]['optimizer_parameters']['reg_base'] * 0.1
 parameters['foundation_model_unfreeze_lr'] = 1e-5
@@ -226,6 +231,8 @@ parameters['backbone_unfreeze_lr_factor']=  0.25
 #---
 parameters['use_simple_aux_loss_scheduling'] = True
 parameters["aux_loss_weight_epoch_limit"] = max(100 , parameters['unfreeze_timer']*(parameters['backbone_num_groups'] +2))
+
+
 
 
 #---
@@ -251,7 +258,7 @@ if parameters['backbone_freeze_on_start']:
 
 if parameters['use_simple_aux_loss_scheduling']:
   parameters['min_epochs']  = max(parameters['min_epochs'], parameters["aux_loss_weight_epoch_limit"]+1)
-parameters['min_epochs'] =  max(parameters['min_epochs'], parameters['num_epochs']/4) #min 1/4 of max epochs
+parameters['min_epochs'] =  max(parameters['min_epochs'], parameters['num_epochs']/3) #min 1/3 of max epochs
 
 
 

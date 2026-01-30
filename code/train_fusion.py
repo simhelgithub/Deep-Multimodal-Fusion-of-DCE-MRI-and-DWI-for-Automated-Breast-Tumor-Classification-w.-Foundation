@@ -9,6 +9,7 @@ from selector_helpers import mask_criterion_selector
 from train import * 
 import numpy as np
 
+
 class LightningFusionModel(pl.LightningModule):
     def __init__(
         self,
@@ -94,8 +95,8 @@ class LightningFusionModel(pl.LightningModule):
 
         #regularization features
         self.attn_reg_enabled = fusion_params["attn_reg_enabled"]
-        self.lambda_attn_sparsity = fusion_params["lambda_attn_sparsity"]
-        self.lambda_attn_consistency = fusion_params["lambda_attn_consistency"]
+        self.lambda_attn_energy = fusion_params["lambda_attn_energy"]
+        self.lambda_feature_consistency = fusion_params["lambda_feature_consistency"]
 
         self.feat_norm_reg_enabled = fusion_params["feat_norm_reg_enabled"]
         self.lambda_feat_norm = fusion_params["lambda_feat_norm"]
@@ -253,16 +254,16 @@ class LightningFusionModel(pl.LightningModule):
             total_loss += self.lambda_mask * mask_loss_val if is_train else 0.0
 
         # ----------------------
-        # Regularization (attention + feature norm)
+        # Regularization  
         # ----------------------
         
         if self.attn_reg_enabled:
-            attn_sparsity_loss = compute_attn_sparsity_loss(aux, self.lambda_attn_sparsity, self.device)
-            attn_consistency_loss = compute_attn_consistency_loss(aux, self.lambda_attn_consistency, self.device)
-            total_loss += attn_sparsity_loss * self.lambda_attn_sparsity + attn_consistency_loss * self.lambda_attn_consistency if is_train else 0.0
+            attn_energy_loss = compute_attn_energy_loss(aux, self.device)
+            feature_consistency_loss = compute_feature_consistency_loss(aux, self.device)
+            total_loss += attn_energy_loss * self.lambda_attn_energy + feature_consistency_loss * self.lambda_feature_consistency if is_train else 0.0
 
         if self.feat_norm_reg_enabled:
-            feat_norm_loss = compute_feat_norm_loss(aux, self.lambda_feat_norm, self.device)
+            feat_norm_loss = compute_feat_norm_loss(aux, self.device)
             total_loss += feat_norm_loss * self.lambda_feat_norm if is_train else 0.0
   
 

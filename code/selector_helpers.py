@@ -300,7 +300,7 @@ class LightningOptimizerFactory:
             def _scheduler(optimizer):
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer,
-                    mode="max",
+                    mode="min",
                     factor=sch_cfg["factor"],
                     patience=sch_cfg["patience"],
                     min_lr=sch_cfg["min_lr"],
@@ -699,7 +699,7 @@ class LightningFusionOptimizerFactory:
             def _scheduler(optimizer):
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer,
-                    mode="max",
+                    mode="min",
                     factor=sch_cfg["factor"],
                     patience=sch_cfg["patience"],
                     min_lr=sch_cfg["min_lr"],

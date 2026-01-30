@@ -6,13 +6,13 @@ import warnings
 from transformer_model import *
 from torch.nn import BatchNorm3d, Identity, init 
 from dataclasses import dataclass
+import math
+
 # -----------------------------
 # Small utilities & losses
 # -----------------------------
-
 def smooth_l1_loss(a, b):
     return F.smooth_l1_loss(a, b)
-
 @dataclass
 class FeatureSpec:
     channels: int
@@ -49,10 +49,6 @@ class ChannelAttention(SEBlock): pass
 class MaskGuidedSpatialAttention(nn.Module):
     """
     Mask-guided spatial attention for 2D/3D.
-    Compile-safe version:
-    - No dynamic control flow
-    - Static interpolation mode
-    - No redundant math
     """
     def __init__(self, in_channels_img, in_channels_mask,
                  hidden_channels=16, dim=2):
@@ -61,7 +57,7 @@ class MaskGuidedSpatialAttention(nn.Module):
         self.dim = dim
 
         Conv = nn.Conv3d if dim == 3 else nn.Conv2d
-        BatchNorm = nn.BatchNorm3d if dim == 3 else nn.BatchNorm2d
+
         self.interp_mode = "trilinear" if dim == 3 else "bilinear"
 
         # Learnable scaling (optional effect strength)
@@ -70,7 +66,7 @@ class MaskGuidedSpatialAttention(nn.Module):
         # Mask → 1-channel attention
         self.mask_processor = nn.Sequential(
             Conv(in_channels_mask, hidden_channels, 1, bias=False),
-            BatchNorm(hidden_channels),
+            nn.GroupNorm(1, hidden_channels),
             nn.GELU(),
             Conv(hidden_channels, 1, 1),
             nn.Sigmoid()  # produces attention in (0,1)
@@ -94,6 +90,7 @@ class MaskGuidedSpatialAttention(nn.Module):
 
         # ---- compute attention ----
         A = self.mask_processor(mask_up)     # (B,1,H,W) or (B,1,D,H,W)
+        A = torch.clamp(A, 1e-4, 1.0 - 1e-4)
 
         # attention: modulate contrast of img_features
         out = img_features * (1 + self.gamma * A)
@@ -355,23 +352,20 @@ class Projector(nn.Module):
 #---
 # classificaiton head
 #---
-
 class ClassificationHead(nn.Module):
-    """
-    Classification head using global pooling and linear layer.
-    2D or 3D inputs.
-    """
-    def __init__(self, in_ch, num_classes, dim=2):
+    def __init__(self, in_ch, num_classes, dim=2, normalize=True):
         super().__init__()
         Pool = nn.AdaptiveAvgPool3d if dim==3 else nn.AdaptiveAvgPool2d
-        self.pool = Pool((1,1,1)) if dim==3 else Pool((1,1))
+        self.pool = Pool((1,1,1) if dim==3 else (1,1))
         self.flatten = nn.Flatten()
         self.fc = nn.Linear(in_ch, num_classes)
+        self.normalize = normalize
 
     def forward(self, x):
-
         x = self.pool(x)
         x = self.flatten(x)
+        if self.normalize:
+            x = F.normalize(x, dim=1)
         return self.fc(x)
 
 class FeatureDownAlign(nn.Module):
@@ -526,7 +520,7 @@ class ModelMaskHeadBackbone(nn.Module):
         self.mask_enabled = mask_parameters["mask"]
         self.mask_stage =  mask_parameters["mask_stage"].lower()
         self.mask_size = mask_parameters['mask_target_size'][0]
-        
+
 
         # ------------------------
         # Config + channels
@@ -595,7 +589,12 @@ class ModelMaskHeadBackbone(nn.Module):
                 self.modality_attention = ChannelAttention(self.channel_num, reduction=2)
             else:
                 raise ValueError("Unknown method for modality attention.")
-
+        #self.f1_weight = nn.Parameter(torch.tensor(0.5))  # scalar for f1 + f1_b
+        self.f2_weight = nn.Parameter(torch.tensor(0.5))  # scalar for f2 + f2_b
+        self.f3_weight = nn.Parameter(torch.tensor(0.5))  # scalar for f3 + f3_b
+        #self.norm_f1 = nn.GroupNorm(c1, c1)
+        self.norm_f2 = nn.GroupNorm(c1, c1)
+        self.norm_f3 = nn.GroupNorm(c2, c2)
         # ------------------------
         # Mask head depends on mask_stage
         # ------------------------
@@ -644,6 +643,8 @@ class ModelMaskHeadBackbone(nn.Module):
     # Forward
     # =====================================================================
     def forward(self, x, masks=None):
+        mask_pred = None
+        mask_attn_map = None
         # Optional modality attention
         if self.modality_attention is not None:
             x_in, mod_attn_map = self.modality_attention(x)
@@ -657,11 +658,12 @@ class ModelMaskHeadBackbone(nn.Module):
         # ------------------------
         # Encoder blocks & mask head placements
         # ------------------------
-        #f1, r1 = self.block1(f1_b if f1_b is not None else x_in)
         if self.use_backbone:
-            f1, r1 = self.block1(f1_b)
+     
+            f1_in = f1_b
         else:
-            f1, r1 = self.block1(x_in)
+            f1_in = x_in
+        f1, r1 = self.block1(f1_in)
 
         if self.mask_enabled and self.mask_stage == "f1":
             mask_pred = self.mask_head(f1)
@@ -669,21 +671,27 @@ class ModelMaskHeadBackbone(nn.Module):
 
         #f2, r2 = self.block2(f1 + (f2_b if f2_b is not None else 0))
         if self.use_backbone:
-            f2, r2 = self.block2(f1+f2_b)
+          alpha = torch.sigmoid(self.f2_weight)
+          f2_in = self.norm_f2(alpha * f2_b + (1 - alpha) * f1)
         else:
-            f2, r2 = self.block2(f1)
+            f2_in = f1
+
+        f2, r2 = self.block2(f2_in)
+        
         if self.mask_enabled and self.mask_stage == "f2":
             f1_aligned = self.f1_to_f2(f1)
             f2_mask_input = f2 + f1_aligned
             mask_pred = self.mask_head(f2_mask_input)
             f2, mask_attn_map = self.mask_spatial_attention(f2, mask_pred)
-        # ---- Final stage, hybdir option ----
+        # ---- Final stage, hybrid option ----
         if not self.use_hybrid_transformer:
-            #f3, _ = self.block3(f2 + (f3_b if f3_b is not None else 0))
             if self.use_backbone:
-                f3, _ = self.block3(f2+f3_b)
+                alpha = torch.sigmoid(self.f3_weight)
+                f3_in = self.norm_f3(alpha * f3_b + (1 - alpha) * f2)
             else:
-                f3, _ = self.block3(f2)
+                f3_in = f2
+
+            f3, _ = self.block3(f3_in)
             if self.mask_enabled and self.mask_stage == "f3":
                 f2_aligned = self.f2_to_f3(f2)
                 f3_mask_input = f3 + f2_aligned
@@ -709,7 +717,6 @@ class ModelMaskHeadBackbone(nn.Module):
         # ------------------------
         # Classification
         # ------------------------
-
         logits = self.classification_head(f3)
         
         # ------------------------
@@ -996,6 +1003,7 @@ def init_parameter(model):
     if isinstance(model, nn.Linear):
         if model.weight is not None:
             init.kaiming_uniform_(model.weight.data)
+            #init.xavier_uniform_(model.weight.data)
         if model.bias is not None:
                 init.constant_(model.bias.data, 0) # Initialize biases to 0
     elif isinstance(model, nn.BatchNorm1d) or isinstance(model, nn.BatchNorm2d) or isinstance(model, nn.BatchNorm3d):

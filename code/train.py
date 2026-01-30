@@ -49,9 +49,9 @@ class LightningSingleModel(pl.LightningModule):
 
         #regularization features
         self.attn_reg_enabled = model_params["attn_reg_enabled"]
-        self.lambda_attn_sparsity = model_params["lambda_attn_sparsity"]
-        self.lambda_attn_consistency = model_params["lambda_attn_consistency"]
-
+        self.lambda_attn_energy = model_params["lambda_attn_energy"]
+        self.lambda_feature_consistency = model_params["lambda_feature_consistency"]
+        
         self.feat_norm_reg_enabled = model_params["feat_norm_reg_enabled"]
         self.lambda_feat_norm = model_params["lambda_feat_norm"]
 
@@ -302,7 +302,7 @@ class LightningSingleModel(pl.LightningModule):
         if self.mask_enabled:
             inputs, masks, labels = batch
         else:
-            inputs, labels = batch
+            inputs, labels= batch
             masks = None
 
         inputs = inputs.to(self.device)
@@ -347,19 +347,19 @@ class LightningSingleModel(pl.LightningModule):
         # REGULARIZATION BLOCK 
         # -------------------------------------
         
-        attn_sparsity_loss = torch.tensor(0.0, device=self.device)
-        attn_consistency_loss = torch.tensor(0.0, device=self.device)
+        attn_energy_loss = torch.tensor(0.0, device=self.device)
+        feature_consistency_loss = torch.tensor(0.0, device=self.device)
         feat_norm_loss = torch.tensor(0.0, device=self.device)
 
         raw_feats = aux.get("raw_feats", None)
 
         # ---- REGULARIZATION ----
         if self.attn_reg_enabled:
-            attn_sparsity_loss = compute_attn_sparsity_loss(aux, self.lambda_attn_sparsity, self.device)
-            attn_consistency_loss = compute_attn_consistency_loss(aux, self.lambda_attn_consistency, self.device)
-            batch_loss+= attn_sparsity_loss * self.lambda_attn_sparsity + attn_consistency_loss* self.lambda_attn_consistency if is_train else 0.0
+            attn_energy_loss = compute_attn_energy_loss(aux, self.lambda_attn_energy, self.device)
+            feature_consistency_loss = compute_feature_consistency_loss(aux, self.lambda_feature_consistency, self.device)
+            batch_loss+= attn_energy_loss * self.lambda_attn_energy + feature_consistency_loss* self.lambda_feature_consistency if is_train else 0.0
         if self.feat_norm_reg_enabled:
-            feat_norm_loss = compute_feat_norm_loss(aux, self.lambda_feat_norm, self.device)
+            feat_norm_loss = compute_feat_norm_loss(aux, self.device)
             batch_loss+= feat_norm_loss * self.lambda_feat_norm if is_train else 0.0
 
 
@@ -367,6 +367,7 @@ class LightningSingleModel(pl.LightningModule):
         # Mask loss
         # ----------------
         mask_out_resized = None
+        mask_loss = 0.0
         if self.mask_enabled: #and mask_output is not None and masks is not None:
             if mask_output.shape[-2:] != masks.shape[-2:]:
                 #print('warning, mask rezised')
@@ -463,25 +464,6 @@ class LightningSingleModel(pl.LightningModule):
             mimic_loss_val = mimic_loss_val * self.lambda_mimic * aux_w
 
         return recon_loss_val, mimic_loss_val
-    #---
-    # Compute reg lossees
-    #--
-
-    def compute_regularization_losses(self, aux):
-        """Compute attention sparsity, attention consistency, and feature norm regularization."""
-        attn_sparsity_loss = torch.tensor(0.0, device=self.device)
-        attn_consistency_loss = torch.tensor(0.0, device=self.device)
-        feat_norm_loss = torch.tensor(0.0, device=self.device)
-
-
-        if self.attn_reg_enabled:
-            attn_sparsity_loss = compute_attn_sparsity_loss(aux, self.lambda_attn_sparsity, self.device)
-            attn_consistency_loss = compute_attn_consistency_loss(aux, self.lambda_attn_consistency, self.device)
-
-        if self.feat_norm_reg_enabled:
-            feat_norm_loss = compute_feat_norm_loss(aux, self.lambda_feat_norm, self.device)
-
-        return attn_sparsity_loss, attn_consistency_loss, feat_norm_loss
 
 
     # ----
@@ -871,7 +853,7 @@ class LightningSingleModel(pl.LightningModule):
                       else:
                           backbone_in_opt.append(False)
               # ---- summarize ----
-              percent_in_opt = 100.0 * sum(backbone_in_opt) / len(backbone_in_opt)
+              percent_in_opt = 100.0 * sum(backbone_in_opt) / len(backbone_in_opt) if len(backbone_in_opt) > 0 else 0
               lr_list = sorted(list(backbone_lrs))
               print(f"[Backbone] Any params in optimizer? {percent_in_opt}, LRs: {lr_list}")
             
@@ -904,7 +886,7 @@ def update_metrics(self, preds, logits, labels, mask_loss_val, recon_loss_val, m
     if phase == "train":
         self.train_f1.update(preds, labels)
         self.train_recon_loss.update(recon_loss_val.detach())
-        self.train_mask_loss.update(mask_loss_val.detach())
+        self.train_mask_loss.update(mask_loss_val.detach()) if self.mask_enabled else self.train_mask_loss.update(0.0)
         self.train_mimic_loss.update(mimic_loss_val.detach())
     elif phase == "val":
               
@@ -1006,17 +988,17 @@ def visualize_single_mask_triplet(input_img, gt_mask, pred_mask, title_prefix=""
     plt.show()
     plt.close("all")
 
-def compute_attn_sparsity_loss(aux, lambda_attn_sparsity, device):
+def compute_attn_energy_loss(aux, device):
     """
-    L1 sparsity on attention maps
+    L1 energy consistency loss on attention maps
     """
     attn_map = aux.get("mask_attn_map", None)
     if attn_map is not None:
-        loss = attn_map.abs().mean() * lambda_attn_sparsity
+        loss = attn_map.abs().mean()
     else:
         loss = torch.tensor(0.0, device=device)
     return loss
-def compute_attn_consistency_loss(aux, lambda_attn_consistency, device):
+def compute_feature_consistency_loss(aux, device):
     """
     Consistency loss between projected features from multiple views
     """
@@ -1032,17 +1014,17 @@ def compute_attn_consistency_loss(aux, lambda_attn_consistency, device):
     p1_norm = p1 / (p1.norm(dim=1, keepdim=True) + 1e-6)
     p2_norm = p2_up / (p2_up.norm(dim=1, keepdim=True) + 1e-6)
 
-    loss = F.mse_loss(p1_norm, p2_norm) * lambda_attn_consistency
+    loss = F.mse_loss(p1_norm, p2_norm)
     return loss
 
     
-def compute_feat_norm_loss(aux, lambda_feat_norm, device):
+def compute_feat_norm_loss(aux, device):
     """
     L2 norm of intermediate features for regularization
     """
     raw_feats = aux.get("raw_feats", None)
-    if raw_feats is not None and lambda_feat_norm > 0:
-        loss = sum([f.pow(2).mean() for f in raw_feats]) * lambda_feat_norm
+    if raw_feats is not None:
+        loss = sum([f.pow(2).mean() for f in raw_feats]) 
     else:
         loss = torch.tensor(0.0, device=device)
     return loss

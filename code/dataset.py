@@ -173,6 +173,8 @@ def data_segmentation(imgs,labels,segnum,classnum,fold):
             val_labels=totallabels[i]
     return [train_imgs,val_imgs],[train_labels,val_labels]
 
+
+
 def data_segmentation_mask(imgs, masks, labels, segnum, classnum, fold):
 
 
@@ -231,7 +233,6 @@ def data_segmentation_mask(imgs, masks, labels, segnum, classnum, fold):
             val_labels=totallabels[i]
 
     return [train_imgs,val_imgs],[train_masks, val_masks],[train_labels,val_labels] # Return segmented masks
-
 
 def Normalize_parameters(imgs):
     print(f"Normalize_parameters: Input imgs shape: {imgs.shape}") 
